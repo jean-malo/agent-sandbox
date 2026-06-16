@@ -68,6 +68,7 @@ func main() {
 	var sandboxTemplateConcurrentWorkers int
 	var sandboxWarmPoolMaxBatchSize int
 	var enableWarmPoolEviction bool
+	var omitPodSandboxLabelWithoutService bool
 	var printVersion bool
 	flag.BoolVar(&printVersion, "version", false, "Print version information and exit.")
 	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local", "Kubernetes cluster domain for service FQDN generation")
@@ -98,6 +99,7 @@ func main() {
 	flag.IntVar(&sandboxTemplateConcurrentWorkers, "sandbox-template-concurrent-workers", 1, "Max concurrent reconciles for the SandboxTemplate controller")
 	flag.IntVar(&sandboxWarmPoolMaxBatchSize, "sandbox-warm-pool-max-batch-size", 300, "Max batch size for parallel sandbox creation and deletion in SandboxWarmPool controller. Default is 300.")
 	flag.BoolVar(&enableWarmPoolEviction, "enable-warm-pool-eviction", true, "Mark pods created by a warm pool as ready-to-evict by default.")
+	flag.BoolVar(&omitPodSandboxLabelWithoutService, "omit-pod-sandbox-label-without-service", false, "Omit the per-Sandbox hash label from Pods unless the Sandbox explicitly enables a Service.")
 	opts := zap.Options{
 		Development: false,
 	}
@@ -237,10 +239,11 @@ func main() {
 	asmetrics.RegisterSandboxCollector(mgr.GetClient(), mgr.GetLogger().WithName("sandbox-collector"))
 
 	if err = (&controllers.SandboxReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		Tracer:        instrumenter,
-		ClusterDomain: clusterDomain,
+		Client:                            mgr.GetClient(),
+		Scheme:                            mgr.GetScheme(),
+		Tracer:                            instrumenter,
+		ClusterDomain:                     clusterDomain,
+		OmitPodSandboxLabelWithoutService: omitPodSandboxLabelWithoutService,
 	}).SetupWithManager(mgr, sandboxConcurrentWorkers); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Sandbox")
 		os.Exit(1)

@@ -121,9 +121,10 @@ func init() {
 // SandboxReconciler reconciles a Sandbox object.
 type SandboxReconciler struct {
 	client.Client
-	Scheme        *runtime.Scheme
-	Tracer        asmetrics.Instrumenter
-	ClusterDomain string
+	Scheme                            *runtime.Scheme
+	Tracer                            asmetrics.Instrumenter
+	ClusterDomain                     string
+	OmitPodSandboxLabelWithoutService bool
 }
 
 //+kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;create;update;patch;delete
@@ -238,7 +239,11 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	if pod == nil {
 		sandbox.Status.PodIPs = nil
 	} else {
-		sandbox.Status.LabelSelector = fmt.Sprintf("%s=%s", sandboxLabel, NameHash(sandbox.Name))
+		if r.podNeedsSandboxLabel(sandbox) {
+			sandbox.Status.LabelSelector = fmt.Sprintf("%s=%s", sandboxLabel, NameHash(sandbox.Name))
+		} else {
+			sandbox.Status.LabelSelector = ""
+		}
 		sandbox.Status.PodIPs = podIPsFromStatus(pod.Status.PodIPs)
 	}
 
@@ -485,6 +490,13 @@ func isControllerManagedPodAnnotation(key string) bool {
 	}
 }
 
+func (r *SandboxReconciler) podNeedsSandboxLabel(sandbox *sandboxv1beta1.Sandbox) bool {
+	if !r.OmitPodSandboxLabelWithoutService {
+		return true
+	}
+	return sandbox.Spec.Service != nil && *sandbox.Spec.Service
+}
+
 func (r *SandboxReconciler) reconcileService(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, nameHash string) (*corev1.Service, error) {
 	logger := log.FromContext(ctx)
 	desired := sandbox.Spec.Service
@@ -657,27 +669,30 @@ func (r *SandboxReconciler) clearServiceStatus(sandbox *sandboxv1beta1.Sandbox) 
 
 func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, nameHash string) (*corev1.Pod, error) {
 	logger := log.FromContext(ctx)
+	podNeedsSandboxLabel := r.podNeedsSandboxLabel(sandbox)
 
 	// Start a child span of ReconcileSandbox
 	ctx, end := r.Tracer.StartSpan(ctx, nil, "reconcilePod", nil)
 	defer end()
 
-	// List all pods with the pool label matching the warm pool name hash
-	// TODO: find a better way to make sure one sandbox has at most one pod
-	podList := &corev1.PodList{}
-	labelSelector := labels.SelectorFromSet(labels.Set{
-		sandboxLabel: nameHash,
-	})
+	if podNeedsSandboxLabel {
+		// List all pods with the pool label matching the warm pool name hash
+		// TODO: find a better way to make sure one sandbox has at most one pod
+		podList := &corev1.PodList{}
+		labelSelector := labels.SelectorFromSet(labels.Set{
+			sandboxLabel: nameHash,
+		})
 
-	if err := r.List(ctx, podList, &client.ListOptions{
-		LabelSelector: labelSelector,
-		Namespace:     sandbox.Namespace,
-	}); err != nil {
-		logger.Error(err, "Failed to list pods")
-	}
+		if err := r.List(ctx, podList, &client.ListOptions{
+			LabelSelector: labelSelector,
+			Namespace:     sandbox.Namespace,
+		}); err != nil {
+			logger.Error(err, "Failed to list pods")
+		}
 
-	if len(podList.Items) > 1 {
-		logger.Info("Multiple pods found for sandbox, this should not happen", "Sandbox", sandbox.Name, "PodCount", len(podList.Items))
+		if len(podList.Items) > 1 {
+			logger.Info("Multiple pods found for sandbox, this should not happen", "Sandbox", sandbox.Name, "PodCount", len(podList.Items))
+		}
 	}
 
 	// Determine the pod name to look up
@@ -841,7 +856,9 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 		managedLabelKeys = append(managedLabelKeys, k)
 	}
 	// Assign system-owned labels after merging user input so they cannot be overridden.
-	podLabels[sandboxLabel] = nameHash
+	if podNeedsSandboxLabel {
+		podLabels[sandboxLabel] = nameHash
+	}
 
 	annotations := map[string]string{}
 	var managedAnnotationKeys []string
@@ -923,12 +940,18 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 func (r *SandboxReconciler) updatePodMetadata(ctx context.Context, pod *corev1.Pod, sandbox *sandboxv1beta1.Sandbox, nameHash string) bool {
 	logger := log.FromContext(ctx)
 	updated := false
+	podNeedsSandboxLabel := r.podNeedsSandboxLabel(sandbox)
 	if pod.Labels == nil {
 		pod.Labels = make(map[string]string)
 	}
-	if pod.Labels[sandboxLabel] != nameHash {
+	if podNeedsSandboxLabel && pod.Labels[sandboxLabel] != nameHash {
 		pod.Labels[sandboxLabel] = nameHash
 		updated = true
+	} else if !podNeedsSandboxLabel {
+		if _, exists := pod.Labels[sandboxLabel]; exists {
+			delete(pod.Labels, sandboxLabel)
+			updated = true
+		}
 	}
 	// Propagate pod template labels to the existing pod (e.g., after warm pool adoption),
 	// skipping system-reserved keys so a user-supplied template cannot override them.
@@ -955,7 +978,7 @@ func (r *SandboxReconciler) updatePodMetadata(ctx context.Context, pod *corev1.P
 				continue
 			}
 			if isSystemLabel(k) {
-				if k == sandboxLabel {
+				if k == sandboxLabel && podNeedsSandboxLabel {
 					continue
 				}
 				if _, exists := pod.Labels[k]; exists {
@@ -1243,10 +1266,16 @@ func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWorkers
 		return err
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
+	controllerBuilder := ctrl.NewControllerManagedBy(mgr).
 		For(&sandboxv1beta1.Sandbox{}).
-		Owns(&corev1.Pod{}, builder.WithPredicates(labelSelectorPredicate)).
 		Owns(&corev1.Service{}, builder.WithPredicates(labelSelectorPredicate)).
-		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentWorkers}).
-		Complete(r)
+		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentWorkers})
+
+	if r.OmitPodSandboxLabelWithoutService {
+		controllerBuilder = controllerBuilder.Owns(&corev1.Pod{})
+	} else {
+		controllerBuilder = controllerBuilder.Owns(&corev1.Pod{}, builder.WithPredicates(labelSelectorPredicate))
+	}
+
+	return controllerBuilder.Complete(r)
 }
