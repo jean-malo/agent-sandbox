@@ -2169,6 +2169,127 @@ func TestReconcilePod(t *testing.T) {
 	}
 }
 
+func TestReconcilePodOmitSandboxLabelWithoutService(t *testing.T) {
+	sandboxName := "sandbox-name"
+	sandboxNs := "sandbox-ns"
+	nameHash := "name-hash"
+
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: sandboxNs,
+			UID:       sandboxUID,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				ObjectMeta: sandboxv1beta1.PodMetadata{
+					Labels: map[string]string{
+						sandboxLabel:   "user-supplied-hash",
+						"custom-label": "label-val",
+					},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+			},
+		},
+	}
+
+	r := SandboxReconciler{
+		Client:                            newFakeClient(sandbox),
+		Scheme:                            Scheme,
+		Tracer:                            asmetrics.NewNoOp(),
+		ClusterDomain:                     "cluster.local",
+		OmitPodSandboxLabelWithoutService: true,
+	}
+
+	pod, err := r.reconcilePod(t.Context(), sandbox, nameHash)
+	require.NoError(t, err)
+	require.NotContains(t, pod.Labels, sandboxLabel)
+	require.Equal(t, "label-val", pod.Labels["custom-label"])
+
+	livePod := &corev1.Pod{}
+	err = r.Get(t.Context(), types.NamespacedName{Name: sandboxName, Namespace: sandboxNs}, livePod)
+	require.NoError(t, err)
+	require.NotContains(t, livePod.Labels, sandboxLabel)
+	require.Equal(t, "label-val", livePod.Labels["custom-label"])
+}
+
+func TestReconcilePodKeepsSandboxLabelWhenServiceNeedsSelector(t *testing.T) {
+	sandboxName := "sandbox-name"
+	sandboxNs := "sandbox-ns"
+	nameHash := "name-hash"
+
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: sandboxNs,
+			UID:       sandboxUID,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+			Service:       ptr.To(true),
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+			},
+		},
+	}
+
+	r := SandboxReconciler{
+		Client:                            newFakeClient(sandbox),
+		Scheme:                            Scheme,
+		Tracer:                            asmetrics.NewNoOp(),
+		ClusterDomain:                     "cluster.local",
+		OmitPodSandboxLabelWithoutService: true,
+	}
+
+	pod, err := r.reconcilePod(t.Context(), sandbox, nameHash)
+	require.NoError(t, err)
+	require.Equal(t, nameHash, pod.Labels[sandboxLabel])
+}
+
+func TestReconcilePodRemovesExistingSandboxLabelWithoutService(t *testing.T) {
+	sandboxName := "sandbox-name"
+	sandboxNs := "sandbox-ns"
+	nameHash := "name-hash"
+
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: sandboxNs,
+			UID:       sandboxUID,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"keep-label": "value"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+			},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            sandboxName,
+			Namespace:       sandboxNs,
+			Labels:          map[string]string{sandboxLabel: nameHash, "keep-label": "value"},
+			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+	}
+
+	r := SandboxReconciler{
+		Client:                            newFakeClient(sandbox, pod),
+		Scheme:                            Scheme,
+		Tracer:                            asmetrics.NewNoOp(),
+		ClusterDomain:                     "cluster.local",
+		OmitPodSandboxLabelWithoutService: true,
+	}
+
+	reconciledPod, err := r.reconcilePod(t.Context(), sandbox, nameHash)
+	require.NoError(t, err)
+	require.NotContains(t, reconciledPod.Labels, sandboxLabel)
+	require.Equal(t, "value", reconciledPod.Labels["keep-label"])
+}
+
 func TestReconcileService(t *testing.T) {
 	sandboxName := "sandbox-name"
 	sandboxNs := "sandbox-ns"
