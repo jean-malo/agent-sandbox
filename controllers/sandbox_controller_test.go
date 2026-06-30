@@ -35,6 +35,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
@@ -45,6 +46,15 @@ func newFakeClient(initialObjs ...runtime.Object) client.WithWatch {
 		WithScheme(Scheme).
 		WithStatusSubresource(&sandboxv1beta1.Sandbox{}).
 		WithRuntimeObjects(initialObjs...).
+		Build()
+}
+
+func newFakeClientWithInterceptor(interceptorFuncs interceptor.Funcs, initialObjs ...runtime.Object) client.WithWatch {
+	return fake.NewClientBuilder().
+		WithScheme(Scheme).
+		WithStatusSubresource(&sandboxv1beta1.Sandbox{}).
+		WithRuntimeObjects(initialObjs...).
+		WithInterceptorFuncs(interceptorFuncs).
 		Build()
 }
 
@@ -280,6 +290,139 @@ func TestResolvePodName(t *testing.T) {
 			require.Equal(t, tc.wantPodName, got)
 		})
 	}
+}
+
+func TestUpdateStatusReturnsStaleSandboxMutation(t *testing.T) {
+	testCases := []struct {
+		name      string
+		statusErr error
+	}{
+		{
+			name:      "sandbox deleted before status update",
+			statusErr: k8serrors.NewNotFound(sandboxv1beta1.Resource("sandboxes"), "sandbox-name"),
+		},
+		{
+			name:      "sandbox changed before status update",
+			statusErr: k8serrors.NewConflict(sandboxv1beta1.Resource("sandboxes"), "sandbox-name", errors.New("resource version is stale")),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			sandbox := &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "sandbox-name",
+					Namespace: "sandbox-ns",
+				},
+			}
+			oldStatus := sandbox.Status.DeepCopy()
+			sandbox.Status.PodIPs = []string{"10.0.0.1"}
+
+			fakeClient := newFakeClientWithInterceptor(interceptor.Funcs{
+				SubResourceUpdate: func(_ context.Context, _ client.Client, subResourceName string, _ client.Object, _ ...client.SubResourceUpdateOption) error {
+					require.Equal(t, "status", subResourceName)
+					return tc.statusErr
+				},
+			}, sandbox.DeepCopy())
+
+			r := &SandboxReconciler{Client: fakeClient}
+			err := r.updateStatus(t.Context(), oldStatus, sandbox)
+			require.ErrorIs(t, err, errStaleSandboxMutation)
+		})
+	}
+}
+
+func TestReconcileIgnoresStaleStatusUpdate(t *testing.T) {
+	sandboxName := "sandbox-name"
+	sandboxNs := "sandbox-ns"
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       sandboxName,
+			Namespace:  sandboxNs,
+			UID:        sandboxUID,
+			Generation: 1,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
+				},
+			},
+		},
+	}
+
+	fakeClient := newFakeClientWithInterceptor(interceptor.Funcs{
+		SubResourceUpdate: func(_ context.Context, _ client.Client, subResourceName string, _ client.Object, _ ...client.SubResourceUpdateOption) error {
+			require.Equal(t, "status", subResourceName)
+			return k8serrors.NewConflict(sandboxv1beta1.Resource("sandboxes"), sandboxName, errors.New("resource version is stale"))
+		},
+	}, sandbox)
+
+	r := &SandboxReconciler{
+		Client:        fakeClient,
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+
+	_, err := r.Reconcile(t.Context(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: sandboxName, Namespace: sandboxNs},
+	})
+	require.NoError(t, err)
+}
+
+func TestReconcileSkipsStaleSandboxAnnotationPatch(t *testing.T) {
+	sandboxName := "sandbox-name"
+	sandboxNs := "sandbox-ns"
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       sandboxName,
+			Namespace:  sandboxNs,
+			UID:        sandboxUID,
+			Generation: 1,
+			Annotations: map[string]string{
+				sandboxv1beta1.SandboxPodNameAnnotation: "stale-pod-name",
+			},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
+				},
+			},
+		},
+	}
+
+	patchCalls := 0
+	fakeClient := newFakeClientWithInterceptor(interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*sandboxv1beta1.Sandbox); ok {
+				patchCalls++
+				return k8serrors.NewConflict(sandboxv1beta1.Resource("sandboxes"), sandboxName, errors.New("resource version is stale"))
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	}, sandbox)
+
+	r := &SandboxReconciler{
+		Client:        fakeClient,
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+
+	result, err := r.Reconcile(t.Context(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: sandboxName, Namespace: sandboxNs},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, result)
+	assert.Equal(t, 1, patchCalls)
+
+	livePod := &corev1.Pod{}
+	err = r.Get(t.Context(), types.NamespacedName{Name: sandboxName, Namespace: sandboxNs}, livePod)
+	require.True(t, k8serrors.IsNotFound(err), "expected stale reconcile to stop before creating a replacement pod")
 }
 
 func TestReconcile(t *testing.T) {
