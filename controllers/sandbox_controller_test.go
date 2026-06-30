@@ -425,6 +425,69 @@ func TestReconcileSkipsStaleSandboxAnnotationPatch(t *testing.T) {
 	require.True(t, k8serrors.IsNotFound(err), "expected stale reconcile to stop before creating a replacement pod")
 }
 
+func TestReconcileIgnoresPodCreateConflictWhenCacheMissesExistingPod(t *testing.T) {
+	sandboxName := "sandbox-name"
+	sandboxNs := "sandbox-ns"
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       sandboxName,
+			Namespace:  sandboxNs,
+			UID:        sandboxUID,
+			Generation: 1,
+			Annotations: map[string]string{
+				sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
+			},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
+				},
+			},
+		},
+	}
+
+	var patchCalls int
+	var createCalls int
+	fakeClient := newFakeClientWithInterceptor(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Pod); ok {
+				return k8serrors.NewNotFound(corev1.Resource("pods"), key.Name)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+		Create: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.CreateOption) error {
+			if _, ok := obj.(*corev1.Pod); ok {
+				createCalls++
+				return k8serrors.NewAlreadyExists(corev1.Resource("pods"), obj.GetName())
+			}
+			return nil
+		},
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*sandboxv1beta1.Sandbox); ok {
+				patchCalls++
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	}, sandbox)
+
+	r := &SandboxReconciler{
+		Client:        fakeClient,
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+
+	result, err := r.Reconcile(t.Context(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: sandboxName, Namespace: sandboxNs},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, result)
+	assert.Equal(t, 1, createCalls)
+	assert.Equal(t, 0, patchCalls)
+}
+
 func TestReconcile(t *testing.T) {
 	sandboxName := "sandbox-name"
 	sandboxNs := "sandbox-ns"

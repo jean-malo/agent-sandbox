@@ -53,7 +53,10 @@ const (
 	immediateRequeueDelay       = time.Millisecond
 )
 
-var errStaleSandboxMutation = errors.New("stale sandbox mutation")
+var (
+	errStaleSandboxMutation = errors.New("stale sandbox mutation")
+	errStaleObservation     = errors.New("stale cached observation")
+)
 
 // isStaleSandboxWrite reports Sandbox writes that should not trigger an immediate
 // controller-runtime error retry. NotFound means the Sandbox is gone; Conflict means
@@ -64,6 +67,10 @@ func isStaleSandboxWrite(err error) bool {
 
 func staleSandboxMutationError(action string, err error) error {
 	return fmt.Errorf("%w: %s: %w", errStaleSandboxMutation, action, err)
+}
+
+func staleObservationError(action string, err error) error {
+	return fmt.Errorf("%w: %s: %w", errStaleObservation, action, err)
 }
 
 // resourceOwnership represents the ownership state of a Kubernetes resource relative to a Sandbox.
@@ -227,7 +234,7 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		sandboxDeleted, err = r.handleSandboxExpiry(ctx, sandbox)
 	} else {
 		err = r.reconcileChildResources(ctx, sandbox)
-		if errors.Is(err, errStaleSandboxMutation) {
+		if errors.Is(err, errStaleSandboxMutation) || errors.Is(err, errStaleObservation) {
 			logger.V(1).Info("Skipping stale sandbox reconcile result", "Sandbox.Namespace", sandbox.Namespace, "Sandbox.Name", sandbox.Name, "error", err.Error())
 			return result, nil
 		}
@@ -268,7 +275,7 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 
 	// Reconcile Pod
 	pod, err := r.reconcilePod(ctx, sandbox, nameHash)
-	if errors.Is(err, errStaleSandboxMutation) {
+	if errors.Is(err, errStaleSandboxMutation) || errors.Is(err, errStaleObservation) {
 		return err
 	}
 	allErrors = errors.Join(allErrors, err)
@@ -760,9 +767,13 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 			return nil, fmt.Errorf("pod get failed: %w", err)
 		}
 		if podNameAnnotationExists {
-			logger.Info("Pod referenced by annotation not found, clearing annotation to recover state", "podName", podName)
-			if err := r.clearPodNameAnnotation(ctx, sandbox); err != nil {
-				return nil, err
+			if podName != sandbox.Name {
+				logger.Info("Pod referenced by annotation not found, clearing annotation to recover state", "podName", podName)
+				if err := r.clearPodNameAnnotation(ctx, sandbox); err != nil {
+					return nil, err
+				}
+			} else {
+				logger.V(1).Info("Tracked pod was not visible in cache", "podName", podName)
 			}
 		}
 		pod = nil
@@ -983,6 +994,10 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 				"Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
 			existingPod := &corev1.Pod{}
 			if getErr := r.Get(ctx, types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, existingPod); getErr != nil {
+				if k8serrors.IsNotFound(getErr) {
+					logger.V(1).Info("Skipping stale pod create conflict", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
+					return nil, staleObservationError("pod create conflicted but cached pod lookup missed", getErr)
+				}
 				return nil, fmt.Errorf("pod already exists but failed to fetch: %w", getErr)
 			}
 			return reconcileExistingPod(existingPod)
