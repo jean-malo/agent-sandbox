@@ -132,17 +132,24 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 
 	const warmPoolReadinessGracePeriod = 5 * time.Minute
 
+	maxBatchSize := int32(r.MaxBatchSize)
 	now := time.Now()
+	stuckSandboxesDeleted := int32(0)
 	var healthySandboxes []sandboxv1beta1.Sandbox
 	for _, sb := range activeSandboxes {
 		if !isSandboxReady(&sb) && !sb.CreationTimestamp.IsZero() && now.Sub(sb.CreationTimestamp.Time) > warmPoolReadinessGracePeriod {
+			if stuckSandboxesDeleted >= maxBatchSize {
+				healthySandboxes = append(healthySandboxes, sb)
+				continue
+			}
 			logger.Info("Deleting stuck warm pool sandbox",
 				"sandbox", sb.Name,
 				"age", now.Sub(sb.CreationTimestamp.Time).Round(time.Second))
-			if err := r.Delete(ctx, &sb); err != nil {
+			if err := r.deletePoolSandbox(ctx, &sb); err != nil {
 				logger.Error(err, "Failed to delete stuck sandbox", "sandbox", sb.Name)
 				allErrors = errors.Join(allErrors, err)
 			}
+			stuckSandboxesDeleted++
 			continue
 		}
 		healthySandboxes = append(healthySandboxes, sb)
@@ -169,8 +176,6 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 		}
 	}
 	warmPool.Status.ReadyReplicas = readyReplicas
-
-	maxBatchSize := int32(r.MaxBatchSize)
 
 	// Create new sandboxes if we need more
 	if currentReplicas < desiredReplicas && tmplErr == nil {

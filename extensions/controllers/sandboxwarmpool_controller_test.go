@@ -858,6 +858,38 @@ func TestReconcilePoolGCStuckSandboxes(t *testing.T) {
 		require.Equal(t, replicas, poolCount)
 		require.Equal(t, replicas, warmPool.Status.Replicas)
 	})
+
+	t.Run("limits stuck sandbox deletion to max batch size", func(t *testing.T) {
+		const maxBatchSize = 2
+		r := SandboxWarmPoolReconciler{
+			Client: fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithRuntimeObjects(
+					template,
+					createSandboxWithAge("-stuck-1", metav1.ConditionFalse, 10*time.Minute),
+					createSandboxWithAge("-stuck-2", metav1.ConditionFalse, 10*time.Minute),
+					createSandboxWithAge("-stuck-3", metav1.ConditionFalse, 10*time.Minute),
+					createSandboxWithAge("-stuck-4", metav1.ConditionFalse, 10*time.Minute),
+				).
+				Build(),
+			Scheme:       scheme,
+			MaxBatchSize: maxBatchSize,
+		}
+
+		ctx := context.Background()
+		err := r.reconcilePool(ctx, warmPool)
+		require.NoError(t, err)
+
+		remainingOriginalStuck := 0
+		for _, suffix := range []string{"-stuck-1", "-stuck-2", "-stuck-3", "-stuck-4"} {
+			var sandbox sandboxv1beta1.Sandbox
+			err = r.Get(ctx, types.NamespacedName{Namespace: poolNamespace, Name: poolName + suffix}, &sandbox)
+			if err == nil {
+				remainingOriginalStuck++
+			}
+		}
+		require.Equal(t, 2, remainingOriginalStuck)
+	})
 }
 
 func TestReconcilePool_TemplateUpdateRollout(t *testing.T) {
