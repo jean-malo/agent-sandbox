@@ -757,12 +757,16 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 
 			logger.Info("Attempting sandbox adoption", "sandbox candidate", adopted.Name, "warm pool", poolName, "claim", claim.Name)
 
-			// Update claim to record adoption (optimistic lock)
+			// Record adoption without updating the whole claim object. Other
+			// reconcile steps may have just patched annotations or status, and
+			// a full-object update would turn those harmless resource-version
+			// changes into adoption latency.
+			claimPatch := client.MergeFrom(claim.DeepCopy())
 			if claim.Annotations == nil {
 				claim.Annotations = make(map[string]string)
 			}
 			claim.Annotations[extensionsv1beta1.AssignedSandboxNameAnnotation] = adopted.Name
-			if err := r.Update(ctx, claim); err != nil {
+			if err := r.Patch(ctx, claim, claimPatch); err != nil {
 				r.WarmSandboxQueue.Add(claim.Spec.WarmPoolRef.Name, adoptedKey)
 				if k8errors.IsConflict(err) {
 					// Conflict means someone else updated the claim. We fail and retry.
