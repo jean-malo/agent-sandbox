@@ -1505,6 +1505,10 @@ func (r *SandboxClaimReconciler) mapWarmPoolToClaims(ctx context.Context, obj cl
 	return requests
 }
 
+func warmPoolClaimRequeuePredicate() predicate.Predicate {
+	return predicate.GenerationChangedPredicate{}
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *SandboxClaimReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWorkers int) error {
 	r.MaxConcurrentReconciles = concurrentWorkers
@@ -1530,7 +1534,7 @@ func (r *SandboxClaimReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWo
 		Watches(
 			&extensionsv1beta1.SandboxWarmPool{},
 			handler.EnqueueRequestsFromMapFunc(r.mapWarmPoolToClaims),
-			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
+			builder.WithPredicates(warmPoolClaimRequeuePredicate()),
 		).
 		// TODO: Keep a lightweight SandboxTemplate -> claims map watch to promptly reconcile
 		// claims when a missing template is created, instead of relying on the 1-minute fallback.

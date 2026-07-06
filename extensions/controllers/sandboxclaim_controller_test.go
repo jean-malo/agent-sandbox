@@ -3714,6 +3714,40 @@ func TestMapWarmPoolToClaims(t *testing.T) {
 	}
 }
 
+func TestWarmPoolClaimRequeuePredicateIgnoresStatusOnlyUpdates(t *testing.T) {
+	p := warmPoolClaimRequeuePredicate()
+	oldWarmPool := &extensionsv1beta1.SandboxWarmPool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "test-warmpool",
+			Namespace:       "default",
+			Generation:      1,
+			ResourceVersion: "1",
+		},
+		Spec: extensionsv1beta1.SandboxWarmPoolSpec{
+			Replicas: 10,
+		},
+		Status: extensionsv1beta1.SandboxWarmPoolStatus{
+			Replicas:      10,
+			ReadyReplicas: 10,
+		},
+	}
+
+	statusOnlyUpdate := oldWarmPool.DeepCopy()
+	statusOnlyUpdate.ResourceVersion = "2"
+	statusOnlyUpdate.Status.ReadyReplicas = 9
+	if p.Update(event.UpdateEvent{ObjectOld: oldWarmPool, ObjectNew: statusOnlyUpdate}) {
+		t.Fatal("status-only SandboxWarmPool update should not enqueue all referencing claims")
+	}
+
+	specUpdate := oldWarmPool.DeepCopy()
+	specUpdate.Generation = 2
+	specUpdate.ResourceVersion = "3"
+	specUpdate.Spec.Replicas = 20
+	if !p.Update(event.UpdateEvent{ObjectOld: oldWarmPool, ObjectNew: specUpdate}) {
+		t.Fatal("generation-changing SandboxWarmPool update should enqueue referencing claims")
+	}
+}
+
 func TestSandboxClaimLegacyLabelMigration(t *testing.T) {
 	scheme := newScheme(t)
 
