@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -52,6 +53,8 @@ const (
 	sandboxTemplateRefHash          = "agents.x-k8s.io/sandbox-template-ref-hash"
 	warmPoolSandboxLabel            = sandboxv1beta1.SandboxWarmPoolLabel
 	sandboxCreateDeleteMaxBatchSize = 300
+	warmPoolCreateCooldown          = 5 * time.Second
+	warmPoolCreateCooldownMinBatch  = 50
 	warmPoolEvictionAnnotation      = "cluster-autoscaler.kubernetes.io/safe-to-evict"
 )
 
@@ -61,6 +64,7 @@ type SandboxWarmPoolReconciler struct {
 	Scheme                 *runtime.Scheme
 	MaxBatchSize           int
 	EnableWarmPoolEviction bool
+	recentPoolCreates      sync.Map
 }
 
 //+kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxwarmpools,verbs=get;list;watch;create;update;patch;delete
@@ -183,20 +187,28 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 	// Create new sandboxes if we need more
 	if currentReplicas < desiredReplicas && tmplErr == nil {
 		sandboxesToCreate := min(desiredReplicas-currentReplicas, maxBatchSize)
-		logger.Info("Creating new pool sandboxes", "count", sandboxesToCreate)
-
-		sandboxCR, err := r.buildSandboxCR(warmPool, poolNameHash, template, currentPodTemplateHash)
-		if err != nil {
-			logger.Error(err, "Failed to build sandbox CR blueprint")
-			allErrors = errors.Join(allErrors, err)
+		if sandboxesToCreate >= warmPoolCreateCooldownMinBatch && !r.reserveCreateBatch(warmPool, now) {
+			logger.Info(
+				"Skipping pool sandbox creation while previous batch settles",
+				"count", sandboxesToCreate,
+				"cooldown", warmPoolCreateCooldown,
+			)
 		} else {
-			// Parallel sandbox creation with adaptive slow-start batching (starts with 1 and doubles on success)
-			_, createErr := slowStartBatch(ctx, int(sandboxesToCreate), 1, func(_ int) error {
-				return r.createPoolSandbox(ctx, warmPool, sandboxCR)
-			})
-			if createErr != nil {
-				logger.Error(createErr, "Failed to create pool sandboxes")
-				allErrors = errors.Join(allErrors, createErr)
+			logger.Info("Creating new pool sandboxes", "count", sandboxesToCreate)
+
+			sandboxCR, err := r.buildSandboxCR(warmPool, poolNameHash, template, currentPodTemplateHash)
+			if err != nil {
+				logger.Error(err, "Failed to build sandbox CR blueprint")
+				allErrors = errors.Join(allErrors, err)
+			} else {
+				// Parallel sandbox creation with adaptive slow-start batching (starts with 1 and doubles on success)
+				_, createErr := slowStartBatch(ctx, int(sandboxesToCreate), 1, func(_ int) error {
+					return r.createPoolSandbox(ctx, warmPool, sandboxCR)
+				})
+				if createErr != nil {
+					logger.Error(createErr, "Failed to create pool sandboxes")
+					allErrors = errors.Join(allErrors, createErr)
+				}
 			}
 		}
 	}
@@ -236,6 +248,21 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 	}
 
 	return allErrors
+}
+
+func (r *SandboxWarmPoolReconciler) reserveCreateBatch(warmPool *extensionsv1beta1.SandboxWarmPool, now time.Time) bool {
+	key := types.NamespacedName{
+		Namespace: warmPool.Namespace,
+		Name:      warmPool.Name,
+	}.String()
+	if rawLastCreated, ok := r.recentPoolCreates.Load(key); ok {
+		lastCreated := rawLastCreated.(time.Time)
+		if now.Sub(lastCreated) < warmPoolCreateCooldown {
+			return false
+		}
+	}
+	r.recentPoolCreates.Store(key, now)
+	return true
 }
 
 // adoptSandbox sets this warmpool as the owner of an orphaned sandbox.

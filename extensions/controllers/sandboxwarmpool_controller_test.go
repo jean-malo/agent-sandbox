@@ -46,6 +46,21 @@ func newTestScheme() *runtime.Scheme {
 	return scheme
 }
 
+func TestReserveCreateBatchCooldown(t *testing.T) {
+	reconciler := &SandboxWarmPoolReconciler{}
+	warmPool := &extensionsv1beta1.SandboxWarmPool{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "test-pool",
+		},
+	}
+	now := time.Now()
+
+	require.True(t, reconciler.reserveCreateBatch(warmPool, now))
+	require.False(t, reconciler.reserveCreateBatch(warmPool, now.Add(time.Second)))
+	require.True(t, reconciler.reserveCreateBatch(warmPool, now.Add(warmPoolCreateCooldown)))
+}
+
 func createPoolSandbox(poolName, namespace, poolNameHash string, template *extensionsv1beta1.SandboxTemplate, suffix string) *sandboxv1beta1.Sandbox {
 	templateRefHash := ""
 	var podTemplateHash string
