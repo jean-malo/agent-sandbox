@@ -614,18 +614,11 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 	logger := log.FromContext(ctx)
 
 	var skipped []queue.SandboxKey
-	var fallbackSandbox *v1beta1.Sandbox
-	var fallbackKey queue.SandboxKey
-	var adoptingFallback bool
 
-	// Instantly returns unused keys the moment we find a valid/ready candidate!
+	// Instantly returns unused keys the moment we find a valid/ready candidate.
 	defer func() {
 		for _, key := range skipped {
 			r.WarmSandboxQueue.Add(claim.Spec.WarmPoolRef.Name, key)
-		}
-		// If we parked a fallback sandbox but never ended up adopting it (due to error or adopting a ready one), requeue it.
-		if fallbackSandbox != nil && !adoptingFallback {
-			r.WarmSandboxQueue.Add(claim.Spec.WarmPoolRef.Name, fallbackKey)
 		}
 	}()
 
@@ -685,11 +678,6 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 	for {
 		adoptedKey, ok := r.WarmSandboxQueue.GetWithStrategy(claim.Spec.WarmPoolRef.Name, pickSmart)
 		if !ok {
-			// No more candidates in our namespace. If we found an unready fallback sandbox, return it.
-			if fallbackSandbox != nil {
-				adoptingFallback = true
-				return fallbackSandbox, fallbackKey, nil
-			}
 			return nil, queue.SandboxKey{}, nil
 		}
 
@@ -722,15 +710,9 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 			return adopted, adoptedKey, nil
 		}
 
-		// Sandbox is valid but NOT Ready.
-		// Keep the first unready sandbox we found as fallback.
-		if fallbackSandbox == nil {
-			fallbackSandbox = adopted
-			fallbackKey = adoptedKey
-		} else {
-			// Push subsequent unready sandboxes to skipped so they go back to the queue
-			skipped = append(skipped, adoptedKey)
-		}
+		// Valid but unready sandboxes should stay in the warm pool. Adopting one
+		// puts pod startup back on the claim creation path.
+		skipped = append(skipped, adoptedKey)
 	}
 }
 

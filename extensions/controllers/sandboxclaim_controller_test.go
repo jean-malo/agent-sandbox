@@ -1960,16 +1960,15 @@ func TestSandboxClaimSandboxAdoption(t *testing.T) {
 			expectNewSandboxCreated: false,
 		},
 		{
-			name: "adopts first available non-ready sandbox from queue",
+			name: "creates new sandbox when only non-ready warm pool sandboxes exist",
 			existingObjects: []client.Object{
 				template,
 				claim,
 				createWarmPoolSandbox("not-ready-1", metav1.Time{Time: metav1.Now().Add(-2 * time.Hour)}, false),
 				createWarmPoolSandbox("not-ready-2", metav1.Time{Time: metav1.Now().Add(-1 * time.Hour)}, false),
 			},
-			expectSandboxAdoption:   true,
-			expectedAdoptedSandbox:  "not-ready-1",
-			expectNewSandboxCreated: false,
+			expectSandboxAdoption:   false,
+			expectNewSandboxCreated: true,
 		},
 		{
 			name: "corrects stale pod-name annotation when adopting sandbox",
@@ -3952,6 +3951,14 @@ func TestSandboxClaimAdoptionStrategy(t *testing.T) {
 			expectedRemainingKeys:  []string{"sb-old-unready"},
 		},
 		{
+			name: "does not adopt unready sandboxes when no ready candidate exists",
+			existingSandboxes: []*sandboxv1beta1.Sandbox{
+				createWarmPoolSandboxWithNode("sb-old-unready", metav1.Time{Time: metav1.Now().Add(-2 * time.Hour)}, false, "node-1"),
+				createWarmPoolSandboxWithNode("sb-young-unready", metav1.Now(), false, "node-2"),
+			},
+			expectedRemainingKeys: []string{"sb-old-unready", "sb-young-unready"},
+		},
+		{
 			name: "picks sandbox on the node with most remaining warmpool sandboxes (NodeSpread balancing)",
 			existingSandboxes: []*sandboxv1beta1.Sandbox{
 				createWarmPoolSandboxWithNode("sb-node1-oldest", metav1.Time{Time: metav1.Now().Add(-2 * time.Hour)}, true, "node-1"),
@@ -4018,13 +4025,25 @@ func TestSandboxClaimAdoptionStrategy(t *testing.T) {
 			_, err := reconciler.Reconcile(context.Background(), req)
 			require.NoError(t, err)
 
-			var adoptedSandbox sandboxv1beta1.Sandbox
-			err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: tc.expectedAdoptedSandbox}, &adoptedSandbox)
-			require.NoError(t, err)
+			if tc.expectedAdoptedSandbox != "" {
+				var adoptedSandbox sandboxv1beta1.Sandbox
+				err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: tc.expectedAdoptedSandbox}, &adoptedSandbox)
+				require.NoError(t, err)
 
-			controllerRef := metav1.GetControllerOf(&adoptedSandbox)
-			require.NotNil(t, controllerRef)
-			require.Equal(t, claim.UID, controllerRef.UID)
+				controllerRef := metav1.GetControllerOf(&adoptedSandbox)
+				require.NotNil(t, controllerRef)
+				require.Equal(t, claim.UID, controllerRef.UID)
+			} else {
+				for _, sandboxName := range tc.expectedRemainingKeys {
+					var sandbox sandboxv1beta1.Sandbox
+					err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: sandboxName}, &sandbox)
+					require.NoError(t, err)
+					controllerRef := metav1.GetControllerOf(&sandbox)
+					require.NotNil(t, controllerRef)
+					require.NotEqual(t, claim.UID, controllerRef.UID)
+					require.Contains(t, sandbox.Labels, warmPoolSandboxLabel)
+				}
+			}
 
 			// Verify that the expected remaining sandbox keys are still queued properly (regression test)
 			var actualRemaining []string
