@@ -1461,9 +1461,8 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 								logger.Info("Successfully migrated legacy sandbox label to annotation during adoption completion", "claim", claim.Name)
 							}
 						}
-						// If succeeded, return error to retry so next reconcile sees it controlled by us!
-						logger.Info("Triggered adoption completion for sandbox, retry", "sandbox", sbName, "claim", claim.Name)
-						return nil, fmt.Errorf("triggered adoption completion for sandbox %s, retry", sbName)
+						logger.Info("Completed adoption for assigned sandbox", "sandbox", sbName, "claim", claim.Name)
+						return sandbox, nil
 					}
 				}
 			}

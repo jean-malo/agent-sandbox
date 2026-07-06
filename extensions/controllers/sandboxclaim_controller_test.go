@@ -3418,10 +3418,10 @@ func TestVerifySandboxCandidate_NamespaceIsolation(t *testing.T) {
 	}
 }
 
-// TestSandboxClaimPreventsDuplicateAdoptionDuringCacheLag verifies that during informer cache lag,
-// the assigned sandbox annotation on the claim is used to identify the previously adopted Sandbox,
-// preventing duplicate adoptions from the warm pool.
-func TestSandboxClaimPreventsDuplicateAdoptionDuringCacheLag(t *testing.T) {
+// TestSandboxClaimCompletesAssignedWarmPoolAdoption verifies that if a claim
+// already records an assigned warm-pool Sandbox, the controller completes that
+// adoption and continues the same reconcile instead of adopting another sandbox.
+func TestSandboxClaimCompletesAssignedWarmPoolAdoption(t *testing.T) {
 	scheme := newScheme(t)
 
 	claim := &extensionsv1beta1.SandboxClaim{
@@ -3531,26 +3531,18 @@ func TestSandboxClaimPreventsDuplicateAdoptionDuringCacheLag(t *testing.T) {
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-claim", Namespace: "default"}}
 
-	// Run reconcile
+	// Run reconcile.
 	_, err := reconciler.Reconcile(context.Background(), req)
-	expectedErr := "triggered adoption completion for sandbox adopted-sb, retry"
-	if err == nil {
-		t.Fatal("Expected reconcile to fail with cache lag error, but it succeeded")
-	} else if err.Error() != expectedErr {
-		t.Errorf("Expected error %q, got: %q", expectedErr, err.Error())
-	}
+	require.NoError(t, err)
 
-	// Verify that the claim status was NOT updated with the sandbox name (due to error)
 	updatedClaim := &extensionsv1beta1.SandboxClaim{}
 	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-claim", Namespace: "default"}, updatedClaim); err != nil {
 		t.Fatalf("failed to get claim: %v", err)
 	}
-
-	if updatedClaim.Status.SandboxStatus.Name == "adopted-sb" {
-		t.Error("expected claim status to NOT be updated with 'adopted-sb' during cache lag")
+	if updatedClaim.Status.SandboxStatus.Name != "adopted-sb" {
+		t.Errorf("expected claim status to be updated with 'adopted-sb', got %q", updatedClaim.Status.SandboxStatus.Name)
 	}
 
-	// Verify that the extra warm sandbox was NOT adopted (it should still have its warm pool labels)
 	var extra sandboxv1beta1.Sandbox
 	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "pool-sb-extra", Namespace: "default"}, &extra); err != nil {
 		t.Fatalf("failed to get extra warm sandbox: %v", err)
@@ -3559,50 +3551,22 @@ func TestSandboxClaimPreventsDuplicateAdoptionDuringCacheLag(t *testing.T) {
 		t.Error("expected extra warm sandbox to still have warm pool label, meaning it was not incorrectly adopted during cache lag")
 	}
 
-	// Simulate the cache catching up!
-	// Fetch the adopted sandbox object, add the SandboxClaim owner reference, and update it in fakeClient.
 	var adopted sandboxv1beta1.Sandbox
 	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "adopted-sb", Namespace: "default"}, &adopted); err != nil {
 		t.Fatalf("failed to get adopted sandbox: %v", err)
 	}
-	adopted.OwnerReferences = []metav1.OwnerReference{{
-		APIVersion: "extensions.agents.x-k8s.io/v1beta1",
-		Kind:       "SandboxClaim",
-		Name:       "test-claim",
-		UID:        "claim-uid-123",
-		Controller: ptr.To(true), // nolint:modernize
-	}}
-	if err := fakeClient.Update(context.Background(), &adopted); err != nil {
-		t.Fatalf("failed to update adopted sandbox with claim owner ref: %v", err)
+	controllerRef := metav1.GetControllerOf(&adopted)
+	if controllerRef == nil {
+		t.Fatal("expected adopted sandbox to have a controller reference")
 	}
-
-	// Run reconcile AGAIN
-	_, err = reconciler.Reconcile(context.Background(), req)
-	if err != nil {
-		t.Fatalf("Expected second Reconcile to succeed after cache caught up, but failed: %v", err)
+	if controllerRef.Kind != "SandboxClaim" || controllerRef.Name != "test-claim" || controllerRef.UID != "claim-uid-123" {
+		t.Errorf("expected adopted sandbox to be controlled by claim, got %#v", controllerRef)
 	}
-
-	// Verify that the claim status WAS updated this time!
-	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-claim", Namespace: "default"}, updatedClaim); err != nil {
-		t.Fatalf("failed to get claim: %v", err)
-	}
-	if updatedClaim.Status.SandboxStatus.Name != "adopted-sb" {
-		t.Errorf("expected claim status to be updated with 'adopted-sb' on 2nd pass, got %q", updatedClaim.Status.SandboxStatus.Name)
-	}
-
-	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "adopted-sb", Namespace: "default"}, &adopted); err != nil {
-		t.Fatalf("failed to get adopted sandbox: %v", err)
+	if _, ok := adopted.Labels[warmPoolSandboxLabel]; ok {
+		t.Error("expected adopted sandbox to have warm pool label removed")
 	}
 	if val := adopted.Labels[sandboxv1beta1.SandboxLaunchTypeLabel]; val != sandboxv1beta1.SandboxLaunchTypeWarm {
 		t.Errorf("expected assigned adopted sandbox to have launch type label %q, got %q; labels=%v", sandboxv1beta1.SandboxLaunchTypeWarm, val, adopted.Labels)
-	}
-
-	// Verify that the extra warm sandbox was STILL NOT adopted (it should still have its warm pool labels)
-	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "pool-sb-extra", Namespace: "default"}, &extra); err != nil {
-		t.Fatalf("failed to get extra warm sandbox: %v", err)
-	}
-	if _, ok := extra.Labels[warmPoolSandboxLabel]; !ok {
-		t.Error("expected extra warm sandbox to still have warm pool label after 2nd pass (should not have been adopted)")
 	}
 }
 
