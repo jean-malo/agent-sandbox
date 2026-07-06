@@ -3752,6 +3752,118 @@ func TestSandboxClaimRecoveryWhenTemplateCreated(t *testing.T) {
 	}
 }
 
+func TestSandboxClaimAdoptionRebuildsEmptyWarmPoolQueue(t *testing.T) {
+	scheme := newScheme(t)
+	const (
+		namespace    = "default"
+		poolName     = "test-pool"
+		templateName = "test-template"
+		claimName    = "test-claim"
+		sandboxName  = "warm-sandbox"
+	)
+
+	template := &extensionsv1beta1.SandboxTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: templateName, Namespace: namespace},
+		Spec: extensionsv1beta1.SandboxTemplateSpec{
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container", Image: "test-image"}},
+				},
+			},
+		},
+	}
+	claim := &extensionsv1beta1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      claimName,
+			Namespace: namespace,
+			UID:       types.UID(claimName + "-uid"),
+		},
+		Spec: extensionsv1beta1.SandboxClaimSpec{
+			WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: poolName},
+		},
+	}
+	warmPool := &extensionsv1beta1.SandboxWarmPool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      poolName,
+			Namespace: namespace,
+			UID:       "warmpool-uid",
+		},
+		Spec: extensionsv1beta1.SandboxWarmPoolSpec{
+			TemplateRef: extensionsv1beta1.SandboxTemplateRef{Name: templateName},
+		},
+	}
+	warmSandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				warmPoolSandboxLabel:   sandboxcontrollers.NameHash(poolName),
+				sandboxTemplateRefHash: sandboxcontrollers.NameHash(templateName),
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "extensions.agents.x-k8s.io/v1beta1",
+					Kind:       "SandboxWarmPool",
+					Name:       poolName,
+					UID:        warmPool.UID,
+					Controller: ptr.To(true), // nolint:modernize
+				},
+			},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container", Image: "test-image"}},
+				},
+			},
+		},
+		Status: sandboxv1beta1.SandboxStatus{
+			NodeName: "node-1",
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(sandboxv1beta1.SandboxConditionReady),
+					Status: metav1.ConditionTrue,
+					Reason: "DependenciesReady",
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(template, claim, warmPool, warmSandbox).
+		WithStatusSubresource(claim).
+		Build()
+
+	reconciler := &SandboxClaimReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		Recorder:         events.NewFakeRecorder(10),
+		WarmSandboxQueue: queue.NewSimpleSandboxQueue(),
+		Tracer:           asmetrics.NewNoOp(),
+	}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: claimName, Namespace: namespace}}
+	_, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+
+	var adoptedSandbox sandboxv1beta1.Sandbox
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: sandboxName}, &adoptedSandbox)
+	require.NoError(t, err)
+	controllerRef := metav1.GetControllerOf(&adoptedSandbox)
+	require.NotNil(t, controllerRef)
+	require.Equal(t, claim.UID, controllerRef.UID)
+
+	var updatedClaim extensionsv1beta1.SandboxClaim
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: claimName}, &updatedClaim)
+	require.NoError(t, err)
+	require.Equal(t, sandboxName, updatedClaim.Annotations[extensionsv1beta1.AssignedSandboxNameAnnotation])
+
+	var coldSandbox sandboxv1beta1.Sandbox
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: claimName}, &coldSandbox)
+	require.True(t, k8errors.IsNotFound(err), "expected warm adoption, not cold-start sandbox creation")
+}
+
 func TestMapWarmPoolToClaims(t *testing.T) {
 	scheme := newScheme(t)
 	warmPoolName := "test-warmpool"

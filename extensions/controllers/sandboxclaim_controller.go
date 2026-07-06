@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"golang.org/x/sync/singleflight"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -48,6 +49,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	sandboxcontrollers "sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	"sigs.k8s.io/agent-sandbox/extensions/controllers/queue"
 	"sigs.k8s.io/agent-sandbox/internal/lifecycle"
@@ -117,6 +119,7 @@ type SandboxClaimReconciler struct {
 	MaxConcurrentReconciles int
 	observedTimes           observedTimeMap
 	AllowedLabelDomains     []string
+	queueRebuilds           singleflight.Group
 }
 
 //+kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxclaims,verbs=get;list;watch;create;update;patch;delete
@@ -736,6 +739,7 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 
 func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context, claim *extensionsv1beta1.SandboxClaim) (*v1beta1.Sandbox, error) {
 	logger := log.FromContext(ctx)
+	queueRebuilt := false
 
 	// Keep trying until we successfully adopt a sandbox, or run out of candidates
 	for range 3 {
@@ -744,6 +748,17 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 			return nil, err
 		}
 		if adopted == nil {
+			if !queueRebuilt {
+				queueRebuilt = true
+				count, err := r.rebuildWarmSandboxQueue(ctx, claim)
+				if err != nil {
+					return nil, err
+				}
+				if count > 0 {
+					logger.Info("Rebuilt warm pool queue from live sandboxes", "claim", claim.Name, "warmPool", claim.Spec.WarmPoolRef.Name, "candidates", count)
+					continue
+				}
+			}
 			logger.Info("Failed to adopt any sandbox after checking all candidates", "claim", claim.Name)
 			return nil, nil // Warm pool is truly empty, fall completely to cold start
 		}
@@ -816,6 +831,53 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 
 	logger.Info("Failed to adopt sandbox after max retries", "claim", claim.Name)
 	return nil, nil
+}
+
+func (r *SandboxClaimReconciler) rebuildWarmSandboxQueue(ctx context.Context, claim *extensionsv1beta1.SandboxClaim) (int, error) {
+	poolName := claim.Spec.WarmPoolRef.Name
+	if poolName == "" {
+		return 0, nil
+	}
+	key := claim.Namespace + "/" + poolName
+	result, err, _ := r.queueRebuilds.Do(key, func() (any, error) {
+		return r.rebuildWarmSandboxQueueOnce(ctx, claim)
+	})
+	if err != nil {
+		return 0, err
+	}
+	count, ok := result.(int)
+	if !ok {
+		return 0, fmt.Errorf("unexpected warm pool queue rebuild result type %T", result)
+	}
+	return count, nil
+}
+
+func (r *SandboxClaimReconciler) rebuildWarmSandboxQueueOnce(ctx context.Context, claim *extensionsv1beta1.SandboxClaim) (int, error) {
+	poolName := claim.Spec.WarmPoolRef.Name
+	sandboxList := &v1beta1.SandboxList{}
+	if err := r.List(
+		ctx,
+		sandboxList,
+		client.InNamespace(claim.Namespace),
+		client.MatchingLabels{warmPoolSandboxLabel: sandboxcontrollers.NameHash(poolName)},
+	); err != nil {
+		return 0, fmt.Errorf("failed to list warm pool sandboxes for claim %q: %w", claim.Name, err)
+	}
+
+	count := 0
+	for i := range sandboxList.Items {
+		sandbox := &sandboxList.Items[i]
+		if err := verifySandboxCandidate(sandbox, claim); err != nil {
+			continue
+		}
+		r.WarmSandboxQueue.Add(poolName, queue.SandboxKey{
+			Namespace: sandbox.Namespace,
+			Name:      sandbox.Name,
+			NodeName:  sandbox.Status.NodeName,
+		})
+		count++
+	}
+	return count, nil
 }
 
 func (r *SandboxClaimReconciler) completeAdoption(ctx context.Context, claim *extensionsv1beta1.SandboxClaim, adopted *v1beta1.Sandbox) error {
