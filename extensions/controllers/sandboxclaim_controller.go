@@ -331,6 +331,12 @@ func (r *SandboxClaimReconciler) reconcileActive(ctx context.Context, claim *ext
 		return nil, err
 	}
 	if sandbox != nil {
+		if sandbox.Labels[v1beta1.SandboxLaunchTypeLabel] == v1beta1.SandboxLaunchTypeWarm &&
+			!hasAdditionalPodMetadata(&claim.Spec.AdditionalPodMetadata) {
+			logger.V(1).Info("Fast path: warm sandbox has no additional metadata to reconcile", "claim", claim.Name, "sandbox", sandbox.Name)
+			return sandbox, nil
+		}
+
 		// Found or adopted. Reconcile network policy (best effort, non blocking).
 		logger.V(1).Info("Fast path: sandbox found or adopted, reconciling network policy", "claim", claim.Name)
 		template, templateErr := r.getTemplate(ctx, claim)
