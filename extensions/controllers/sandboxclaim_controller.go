@@ -1689,6 +1689,64 @@ func sandboxClaimUpdateAffectsReconcile(oldClaim, newClaim *extensionsv1beta1.Sa
 	return !equality.Semantic.DeepEqual(oldClaim.OwnerReferences, newClaim.OwnerReferences)
 }
 
+func ownedSandboxUpdateAffectsClaimReconcile(oldSandbox, newSandbox *v1beta1.Sandbox) bool {
+	if oldSandbox.UID != newSandbox.UID {
+		return true
+	}
+	if oldSandbox.DeletionTimestamp.IsZero() != newSandbox.DeletionTimestamp.IsZero() {
+		return true
+	}
+	if oldSandbox.Generation != newSandbox.Generation {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(oldSandbox.Spec, newSandbox.Spec) {
+		return true
+	}
+	if !maps.Equal(oldSandbox.Labels, newSandbox.Labels) || !maps.Equal(oldSandbox.Annotations, newSandbox.Annotations) {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(oldSandbox.Finalizers, newSandbox.Finalizers) {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(oldSandbox.OwnerReferences, newSandbox.OwnerReferences) {
+		return true
+	}
+	if !slices.Equal(oldSandbox.Status.PodIPs, newSandbox.Status.PodIPs) {
+		return true
+	}
+	return sandboxConditionChanged(oldSandbox.Status.Conditions, newSandbox.Status.Conditions, string(v1beta1.SandboxConditionReady)) ||
+		sandboxConditionChanged(oldSandbox.Status.Conditions, newSandbox.Status.Conditions, string(v1beta1.SandboxConditionFinished))
+}
+
+func sandboxConditionChanged(oldConditions, newConditions []metav1.Condition, conditionType string) bool {
+	return !equality.Semantic.DeepEqual(
+		meta.FindStatusCondition(oldConditions, conditionType),
+		meta.FindStatusCondition(newConditions, conditionType),
+	)
+}
+
+func ownedSandboxClaimRequeuePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(_ event.CreateEvent) bool {
+			return true
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldSandbox, oldOK := e.ObjectOld.(*v1beta1.Sandbox)
+			newSandbox, newOK := e.ObjectNew.(*v1beta1.Sandbox)
+			if !oldOK || !newOK {
+				return true
+			}
+			return ownedSandboxUpdateAffectsClaimReconcile(oldSandbox, newSandbox)
+		},
+		DeleteFunc: func(_ event.DeleteEvent) bool {
+			return true
+		},
+		GenericFunc: func(_ event.GenericEvent) bool {
+			return false
+		},
+	}
+}
+
 // mapWarmPoolToClaims maps a SandboxWarmPool to a list of SandboxClaims that reference it.
 func (r *SandboxClaimReconciler) mapWarmPoolToClaims(ctx context.Context, obj client.Object) []ctrl.Request {
 	warmPool, ok := obj.(*extensionsv1beta1.SandboxWarmPool)
@@ -1732,7 +1790,7 @@ func (r *SandboxClaimReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWo
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&extensionsv1beta1.SandboxClaim{}, builder.WithPredicates(r.getTimingPredicate())).
-		Owns(&v1beta1.Sandbox{}).
+		Owns(&v1beta1.Sandbox{}, builder.WithPredicates(ownedSandboxClaimRequeuePredicate())).
 		Watches(&v1beta1.Sandbox{}, &sandboxEventHandler{sandboxQueue: r.WarmSandboxQueue}).
 		Watches(&extensionsv1beta1.SandboxWarmPool{}, &warmPoolEventHandler{sandboxQueue: r.WarmSandboxQueue}).
 		Watches(
