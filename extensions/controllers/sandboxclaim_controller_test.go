@@ -4196,14 +4196,14 @@ func TestSandboxClaimAdoptionStrategy(t *testing.T) {
 			expectedRemainingKeys:  []string{"sb-old-unready"},
 		},
 		{
-			name: "picks sandbox on the node with most remaining warmpool sandboxes (NodeSpread balancing)",
+			name: "uses FIFO order even when warm pool node distribution differs",
 			existingSandboxes: []*sandboxv1beta1.Sandbox{
 				createWarmPoolSandboxWithNode("sb-node1-oldest", metav1.Time{Time: metav1.Now().Add(-2 * time.Hour)}, true, "node-1"),
 				createWarmPoolSandboxWithNode("sb-node2-younger-1", metav1.Time{Time: metav1.Now().Add(-1 * time.Hour)}, true, "node-2"),
 				createWarmPoolSandboxWithNode("sb-node2-younger-2", metav1.Now(), true, "node-2"),
 			},
-			expectedAdoptedSandbox: "sb-node2-younger-1",
-			expectedRemainingKeys:  []string{"sb-node1-oldest", "sb-node2-younger-2"},
+			expectedAdoptedSandbox: "sb-node1-oldest",
+			expectedRemainingKeys:  []string{"sb-node2-younger-1", "sb-node2-younger-2"},
 		},
 	}
 
