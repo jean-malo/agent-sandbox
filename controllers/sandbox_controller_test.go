@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
@@ -2494,6 +2495,130 @@ func TestReconcilePodRemovesExistingSandboxLabelWithoutService(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, reconciledPod.Labels, sandboxLabel)
 	require.Equal(t, "value", reconciledPod.Labels["keep-label"])
+}
+
+func TestSandboxPodUpdateAffectsReconcile(t *testing.T) {
+	basePod := func() *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "sandbox-name",
+				Namespace:       "sandbox-ns",
+				Labels:          map[string]string{"app": "sandbox"},
+				Annotations:     map[string]string{"annotation": "value"},
+				OwnerReferences: []metav1.OwnerReference{sandboxControllerRef("sandbox-name")},
+			},
+			Spec: corev1.PodSpec{
+				NodeName:   "node-1",
+				Containers: []corev1.Container{{Name: "container"}},
+			},
+			Status: corev1.PodStatus{
+				Phase:  corev1.PodRunning,
+				PodIPs: []corev1.PodIP{{IP: "10.0.0.1"}},
+				Conditions: []corev1.PodCondition{{
+					Type:   corev1.PodReady,
+					Status: corev1.ConditionTrue,
+				}},
+			},
+		}
+	}
+
+	deletionTimestamp := metav1.NewTime(time.Now())
+	tests := []struct {
+		name string
+		edit func(*corev1.Pod)
+		want bool
+	}{
+		{
+			name: "resource version only",
+			edit: func(pod *corev1.Pod) {
+				pod.ResourceVersion = "2"
+			},
+			want: false,
+		},
+		{
+			name: "phase changed",
+			edit: func(pod *corev1.Pod) {
+				pod.Status.Phase = corev1.PodSucceeded
+			},
+			want: true,
+		},
+		{
+			name: "ready status changed",
+			edit: func(pod *corev1.Pod) {
+				pod.Status.Conditions[0].Status = corev1.ConditionFalse
+			},
+			want: true,
+		},
+		{
+			name: "pod IPs changed",
+			edit: func(pod *corev1.Pod) {
+				pod.Status.PodIPs = []corev1.PodIP{{IP: "10.0.0.2"}}
+			},
+			want: true,
+		},
+		{
+			name: "node name changed",
+			edit: func(pod *corev1.Pod) {
+				pod.Spec.NodeName = "node-2"
+			},
+			want: true,
+		},
+		{
+			name: "deletion started",
+			edit: func(pod *corev1.Pod) {
+				pod.DeletionTimestamp = &deletionTimestamp
+			},
+			want: true,
+		},
+		{
+			name: "controller reference changed",
+			edit: func(pod *corev1.Pod) {
+				pod.OwnerReferences[0].UID = types.UID("other-sandbox-uid")
+			},
+			want: true,
+		},
+		{
+			name: "labels changed",
+			edit: func(pod *corev1.Pod) {
+				pod.Labels["app"] = "updated"
+			},
+			want: true,
+		},
+		{
+			name: "annotations changed",
+			edit: func(pod *corev1.Pod) {
+				pod.Annotations["annotation"] = "updated"
+			},
+			want: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			oldPod := basePod()
+			newPod := oldPod.DeepCopy()
+			tc.edit(newPod)
+
+			got := sandboxPodUpdateAffectsReconcile(oldPod, newPod)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestSandboxPodUpdatePredicateLifecycleEvents(t *testing.T) {
+	predicate := sandboxPodUpdatePredicate()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "sandbox-name",
+			Namespace:       "sandbox-ns",
+			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef("sandbox-name")},
+		},
+	}
+
+	require.True(t, predicate.Create(event.CreateEvent{Object: pod}))
+	require.True(t, predicate.Delete(event.DeleteEvent{Object: pod}))
+	require.False(t, predicate.Generic(event.GenericEvent{Object: pod}))
 }
 
 func TestReconcileService(t *testing.T) {

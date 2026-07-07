@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
@@ -1376,11 +1377,78 @@ func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWorkers
 		Owns(&corev1.Service{}, builder.WithPredicates(labelSelectorPredicate)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentWorkers})
 
+	podUpdatePredicate := sandboxPodUpdatePredicate()
 	if r.OmitPodSandboxLabelWithoutService {
-		controllerBuilder = controllerBuilder.Owns(&corev1.Pod{})
+		controllerBuilder = controllerBuilder.Owns(&corev1.Pod{}, builder.WithPredicates(podUpdatePredicate))
 	} else {
-		controllerBuilder = controllerBuilder.Owns(&corev1.Pod{}, builder.WithPredicates(labelSelectorPredicate))
+		controllerBuilder = controllerBuilder.Owns(&corev1.Pod{}, builder.WithPredicates(predicate.And(labelSelectorPredicate, podUpdatePredicate)))
 	}
 
 	return controllerBuilder.Complete(r)
+}
+
+func sandboxPodUpdatePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool {
+			return true
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldPod, oldOK := e.ObjectOld.(*corev1.Pod)
+			newPod, newOK := e.ObjectNew.(*corev1.Pod)
+			if !oldOK || !newOK {
+				return true
+			}
+			return sandboxPodUpdateAffectsReconcile(oldPod, newPod)
+		},
+		DeleteFunc: func(event.DeleteEvent) bool {
+			return true
+		},
+		GenericFunc: func(event.GenericEvent) bool {
+			return false
+		},
+	}
+}
+
+func sandboxPodUpdateAffectsReconcile(oldPod, newPod *corev1.Pod) bool {
+	if oldPod.DeletionTimestamp.IsZero() != newPod.DeletionTimestamp.IsZero() {
+		return true
+	}
+	if oldPod.Generation != newPod.Generation {
+		return true
+	}
+	if !sameControllerRef(metav1.GetControllerOf(oldPod), metav1.GetControllerOf(newPod)) {
+		return true
+	}
+	if !maps.Equal(oldPod.Labels, newPod.Labels) || !maps.Equal(oldPod.Annotations, newPod.Annotations) {
+		return true
+	}
+	if oldPod.Status.Phase != newPod.Status.Phase {
+		return true
+	}
+	if oldPod.Spec.NodeName != newPod.Spec.NodeName {
+		return true
+	}
+	if !reflect.DeepEqual(oldPod.Status.PodIPs, newPod.Status.PodIPs) {
+		return true
+	}
+	return podReadyStatus(oldPod) != podReadyStatus(newPod)
+}
+
+func sameControllerRef(oldRef, newRef *metav1.OwnerReference) bool {
+	if oldRef == nil || newRef == nil {
+		return oldRef == nil && newRef == nil
+	}
+	return oldRef.APIVersion == newRef.APIVersion &&
+		oldRef.Kind == newRef.Kind &&
+		oldRef.Name == newRef.Name &&
+		oldRef.UID == newRef.UID
+}
+
+func podReadyStatus(pod *corev1.Pod) corev1.ConditionStatus {
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status
+		}
+	}
+	return corev1.ConditionUnknown
 }
