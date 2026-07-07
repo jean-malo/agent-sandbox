@@ -14,6 +14,7 @@
 package queue
 
 import (
+	"strconv"
 	"testing"
 )
 
@@ -61,18 +62,18 @@ func TestSimpleSandboxQueue_RemoveItem_GhostPodFix(t *testing.T) {
 	// Simulate the Kubelet deleting the middle pod (Ghost Pod scenario)
 	q.RemoveItem(hash, key2)
 
-	// Ensure RemoveItem does not retain stale references in backing array tail.
+	// Ensure RemoveItem clears the indexed slot so stale keys cannot be popped.
 	rawQueue, ok := q.queues.Load(hash)
 	if !ok {
 		t.Fatalf("Expected queue for %q to exist", hash)
 	}
 	sq := rawQueue.(*synchronizedQueue)
-	if cap(sq.items) > len(sq.items) {
-		backing := sq.items[:cap(sq.items)]
-		for i := len(sq.items); i < len(backing); i++ {
-			if backing[i] != (SandboxKey{}) {
-				t.Errorf("Expected backing array slot %d to be cleared, found %+v", i, backing[i])
-			}
+	if _, exists := sq.index[sandboxKeyID(key2)]; exists {
+		t.Fatalf("Expected removed key %v to be absent from queue index", key2)
+	}
+	for _, item := range sq.items {
+		if item == key2 {
+			t.Fatalf("Expected removed key %v to be cleared from queue items", key2)
 		}
 	}
 
@@ -104,14 +105,37 @@ func TestSynchronizedQueue_Deduplication(t *testing.T) {
 	q.Push(key)
 	q.Push(key)
 
-	// Verify it only stored it once
+	// Verify it only stored it once.
 	if len(q.items) != 1 {
-		t.Errorf("Expected length 1 due to O(1) deduplication, got %d", len(q.items))
+		t.Errorf("Expected item length 1 due to O(1) deduplication, got %d", len(q.items))
 	}
 
-	// Verify the set also only has 1 item
-	if len(q.set) != 1 {
-		t.Errorf("Expected set length 1, got %d", len(q.set))
+	// Verify the index also only has 1 item.
+	if len(q.index) != 1 {
+		t.Errorf("Expected index length 1, got %d", len(q.index))
+	}
+}
+
+func TestSynchronizedQueue_CompactsMiddleRemovals(t *testing.T) {
+	q := newSynchronizedQueue()
+	keys := make([]SandboxKey, 2048)
+	for i := range keys {
+		keys[i] = SandboxKey{Namespace: "default", Name: "sb-" + strconv.Itoa(i)}
+		q.Push(keys[i])
+	}
+
+	for i := 0; i < 1024; i++ {
+		q.Remove(keys[i])
+	}
+
+	if q.head != 0 {
+		t.Fatalf("Expected compacted queue head to reset to 0, got %d", q.head)
+	}
+	if q.tombstones != 0 {
+		t.Fatalf("Expected compacted queue tombstones to reset to 0, got %d", q.tombstones)
+	}
+	if len(q.items) != len(q.index) {
+		t.Fatalf("Expected compacted item count to match index count, got %d items and %d indexed keys", len(q.items), len(q.index))
 	}
 }
 

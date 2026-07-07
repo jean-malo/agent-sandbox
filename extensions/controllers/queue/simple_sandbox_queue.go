@@ -78,64 +78,85 @@ func (s *SimpleSandboxQueue) RemoveItem(warmPoolName string, item SandboxKey) {
 	}
 }
 
-// Remove scans the slice and deletes the item to prevent Ghost Pods.
+// Remove deletes the item to prevent ghost pods from staying adoptable.
 func (q *synchronizedQueue) Remove(key SandboxKey) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	uniqueID := key.Namespace + "/" + key.Name
-	if _, exists := q.set[uniqueID]; !exists {
+	uniqueID := sandboxKeyID(key)
+	itemIndex, exists := q.index[uniqueID]
+	if !exists {
 		return
 	}
 
-	delete(q.set, uniqueID)
-
-	for i, k := range q.items {
-		if k.Namespace == key.Namespace && k.Name == key.Name {
-			// Shift left and clear the tail slot so removed keys don't linger.
-			// Same pattern as Pop()
-			last := len(q.items) - 1
-			copy(q.items[i:], q.items[i+1:])
-			q.items[last] = SandboxKey{}
-			q.items = q.items[:last]
-			break
-		}
+	delete(q.index, uniqueID)
+	q.items[itemIndex] = SandboxKey{}
+	if itemIndex >= q.head {
+		q.tombstones++
 	}
+	q.compactLocked()
 }
 
 // TODO(vicentefb): Implement queue cleanup mechanism.
 // We should remove the queue from the sync.Map when the corresponding
 // SandboxWarmPool is deleted to prevent memory leaks.
 type synchronizedQueue struct {
-	mu    sync.Mutex
-	items []SandboxKey
-	set   map[string]struct{} // Used for O(1) deduplication by namespace/name
+	mu         sync.Mutex
+	items      []SandboxKey
+	head       int
+	tombstones int
+	index      map[string]int // Used for O(1) deduplication and removal by namespace/name.
 }
 
 func newSynchronizedQueue() *synchronizedQueue {
 	return &synchronizedQueue{
 		items: make([]SandboxKey, 0),
-		set:   make(map[string]struct{}),
+		index: make(map[string]int),
 	}
+}
+
+func sandboxKeyID(key SandboxKey) string {
+	return key.Namespace + "/" + key.Name
+}
+
+func emptySandboxKey(key SandboxKey) bool {
+	return key.Namespace == "" && key.Name == ""
+}
+
+func (q *synchronizedQueue) compactLocked() {
+	removed := q.head + q.tombstones
+	if removed == 0 {
+		return
+	}
+	if removed < 1024 && removed*2 < len(q.items) {
+		return
+	}
+
+	compacted := make([]SandboxKey, 0, len(q.items)-q.head)
+	q.index = make(map[string]int, len(q.index))
+	for _, key := range q.items[q.head:] {
+		if emptySandboxKey(key) {
+			continue
+		}
+		q.index[sandboxKeyID(key)] = len(compacted)
+		compacted = append(compacted, key)
+	}
+	q.items = compacted
+	q.head = 0
+	q.tombstones = 0
 }
 
 // Push adds an item to the queue if it isn't already present.
 func (q *synchronizedQueue) Push(key SandboxKey) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	uniqueID := key.Namespace + "/" + key.Name
-	if _, exists := q.set[uniqueID]; !exists {
-		q.set[uniqueID] = struct{}{}
-		q.items = append(q.items, key)
-	} else {
-		// Key already exists. Always update the NodeName to reflect latest placement state.
-		for i := range q.items {
-			if q.items[i].Namespace == key.Namespace && q.items[i].Name == key.Name {
-				q.items[i].NodeName = key.NodeName
-				break
-			}
-		}
+	uniqueID := sandboxKeyID(key)
+	if itemIndex, exists := q.index[uniqueID]; exists {
+		q.items[itemIndex] = key
+		return
 	}
+	q.index[uniqueID] = len(q.items)
+	q.items = append(q.items, key)
 }
 
 // Pop removes and returns the first item from the queue.
@@ -143,22 +164,21 @@ func (q *synchronizedQueue) Pop() (SandboxKey, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	if len(q.items) == 0 {
-		return SandboxKey{}, false
+	for q.head < len(q.items) {
+		item := q.items[q.head]
+		q.items[q.head] = SandboxKey{}
+		q.head++
+		if emptySandboxKey(item) {
+			continue
+		}
+
+		delete(q.index, sandboxKeyID(item))
+		q.compactLocked()
+		return item, true
 	}
 
-	// Grab the first item
-	item := q.items[0]
-
-	// This removes the pointer references so the Garbage Collector
-	// can free the strings in memory!
-	q.items[0] = SandboxKey{}
-
-	// Remove it from slice and set
-	q.items = q.items[1:]
-	delete(q.set, item.Namespace+"/"+item.Name)
-
-	return item, true
+	q.compactLocked()
+	return SandboxKey{}, false
 }
 
 // PopWithStrategy applies the strategy function to pick an item from the queue,
@@ -166,14 +186,18 @@ func (q *synchronizedQueue) Pop() (SandboxKey, bool) {
 func (q *synchronizedQueue) PopWithStrategy(pick func([]SandboxKey) (SandboxKey, bool)) (SandboxKey, bool) {
 	for {
 		q.mu.Lock()
-		if len(q.items) == 0 {
+		if len(q.index) == 0 {
 			q.mu.Unlock()
 			return SandboxKey{}, false
 		}
 
 		// Snapshot the queue items
-		snapshot := make([]SandboxKey, len(q.items))
-		copy(snapshot, q.items)
+		snapshot := make([]SandboxKey, 0, len(q.index))
+		for _, key := range q.items[q.head:] {
+			if !emptySandboxKey(key) {
+				snapshot = append(snapshot, key)
+			}
+		}
 		q.mu.Unlock()
 
 		key, ok := pick(snapshot)
@@ -182,27 +206,22 @@ func (q *synchronizedQueue) PopWithStrategy(pick func([]SandboxKey) (SandboxKey,
 		}
 
 		q.mu.Lock()
-		uniqueID := key.Namespace + "/" + key.Name
+		uniqueID := sandboxKeyID(key)
 		// Verify the key is still present in the queue
-		if _, exists := q.set[uniqueID]; !exists {
+		itemIndex, exists := q.index[uniqueID]
+		if !exists {
 			// The picked key was concurrently popped by another goroutine.
 			// Unlock and retry snapshot and pick.
 			q.mu.Unlock()
 			continue
 		}
 
-		// Find the picked key in q.items and remove it
-		for i, k := range q.items {
-			if k.Namespace == key.Namespace && k.Name == key.Name {
-				// Shift left and clear the tail slot
-				last := len(q.items) - 1
-				copy(q.items[i:], q.items[i+1:])
-				q.items[last] = SandboxKey{}
-				q.items = q.items[:last]
-				break
-			}
+		q.items[itemIndex] = SandboxKey{}
+		delete(q.index, uniqueID)
+		if itemIndex >= q.head {
+			q.tombstones++
 		}
-		delete(q.set, uniqueID)
+		q.compactLocked()
 		q.mu.Unlock()
 
 		return key, true
