@@ -506,12 +506,15 @@ func (r *SandboxReconciler) updateStatus(ctx context.Context, oldStatus *sandbox
 		return nil
 	}
 
-	if err := r.Status().Update(ctx, sandbox); err != nil {
+	oldSandbox := sandbox.DeepCopy()
+	oldSandbox.Status = *oldStatus
+
+	if err := r.Status().Patch(ctx, sandbox, client.MergeFrom(oldSandbox)); err != nil {
 		if isStaleSandboxWrite(err) {
-			logger.V(1).Info("Skipping stale sandbox status update", "Sandbox.Namespace", sandbox.Namespace, "Sandbox.Name", sandbox.Name, "error", err.Error())
-			return staleSandboxMutationError("failed to update sandbox status", err)
+			logger.V(1).Info("Skipping stale sandbox status patch", "Sandbox.Namespace", sandbox.Namespace, "Sandbox.Name", sandbox.Name, "error", err.Error())
+			return staleSandboxMutationError("failed to patch sandbox status", err)
 		}
-		logger.Error(err, "Failed to update sandbox status")
+		logger.Error(err, "Failed to patch sandbox status")
 		return err
 	}
 

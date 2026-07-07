@@ -320,7 +320,7 @@ func TestUpdateStatusReturnsStaleSandboxMutation(t *testing.T) {
 			sandbox.Status.PodIPs = []string{"10.0.0.1"}
 
 			fakeClient := newFakeClientWithInterceptor(interceptor.Funcs{
-				SubResourceUpdate: func(_ context.Context, _ client.Client, subResourceName string, _ client.Object, _ ...client.SubResourceUpdateOption) error {
+				SubResourcePatch: func(_ context.Context, _ client.Client, subResourceName string, _ client.Object, _ client.Patch, _ ...client.SubResourcePatchOption) error {
 					require.Equal(t, "status", subResourceName)
 					return tc.statusErr
 				},
@@ -331,6 +331,65 @@ func TestUpdateStatusReturnsStaleSandboxMutation(t *testing.T) {
 			require.ErrorIs(t, err, errStaleSandboxMutation)
 		})
 	}
+}
+
+func TestUpdateStatusSkipsUnchangedStatus(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sandbox-name",
+			Namespace: "sandbox-ns",
+		},
+		Status: sandboxv1beta1.SandboxStatus{
+			PodIPs: []string{"10.0.0.1"},
+		},
+	}
+	oldStatus := sandbox.Status.DeepCopy()
+
+	patchCalls := 0
+	fakeClient := newFakeClientWithInterceptor(interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			patchCalls++
+			return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+		},
+	}, sandbox.DeepCopy())
+
+	r := &SandboxReconciler{Client: fakeClient}
+	err := r.updateStatus(t.Context(), oldStatus, sandbox)
+	require.NoError(t, err)
+	assert.Equal(t, 0, patchCalls)
+}
+
+func TestUpdateStatusPatchesOnlyStatus(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sandbox-name",
+			Namespace: "sandbox-ns",
+			Labels: map[string]string{
+				"existing": "label",
+			},
+		},
+	}
+	oldStatus := sandbox.Status.DeepCopy()
+	sandbox.Status.PodIPs = []string{"10.0.0.1"}
+
+	fakeClient := newFakeClient(sandbox.DeepCopy())
+
+	liveSandbox := &sandboxv1beta1.Sandbox{}
+	err := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(sandbox), liveSandbox)
+	require.NoError(t, err)
+	liveSandbox.Labels["concurrent"] = "metadata-change"
+	err = fakeClient.Update(t.Context(), liveSandbox)
+	require.NoError(t, err)
+
+	r := &SandboxReconciler{Client: fakeClient}
+	err = r.updateStatus(t.Context(), oldStatus, sandbox)
+	require.NoError(t, err)
+
+	got := &sandboxv1beta1.Sandbox{}
+	err = fakeClient.Get(t.Context(), client.ObjectKeyFromObject(sandbox), got)
+	require.NoError(t, err)
+	assert.Equal(t, "metadata-change", got.Labels["concurrent"])
+	assert.Equal(t, []string{"10.0.0.1"}, got.Status.PodIPs)
 }
 
 func TestReconcileIgnoresStaleStatusUpdate(t *testing.T) {
@@ -354,7 +413,7 @@ func TestReconcileIgnoresStaleStatusUpdate(t *testing.T) {
 	}
 
 	fakeClient := newFakeClientWithInterceptor(interceptor.Funcs{
-		SubResourceUpdate: func(_ context.Context, _ client.Client, subResourceName string, _ client.Object, _ ...client.SubResourceUpdateOption) error {
+		SubResourcePatch: func(_ context.Context, _ client.Client, subResourceName string, _ client.Object, _ client.Patch, _ ...client.SubResourcePatchOption) error {
 			require.Equal(t, "status", subResourceName)
 			return k8serrors.NewConflict(sandboxv1beta1.Resource("sandboxes"), sandboxName, errors.New("resource version is stale"))
 		},
