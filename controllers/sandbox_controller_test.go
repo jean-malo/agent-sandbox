@@ -2497,6 +2497,134 @@ func TestReconcilePodRemovesExistingSandboxLabelWithoutService(t *testing.T) {
 	require.Equal(t, "value", reconciledPod.Labels["keep-label"])
 }
 
+func TestSandboxUpdateAffectsReconcile(t *testing.T) {
+	baseSandbox := func() *sandboxv1beta1.Sandbox {
+		return &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "sandbox-name",
+				Namespace:       "sandbox-ns",
+				Generation:      1,
+				Labels:          map[string]string{"app": "sandbox"},
+				Annotations:     map[string]string{"annotation": "value"},
+				Finalizers:      []string{"agents.x-k8s.io/finalizer"},
+				OwnerReferences: []metav1.OwnerReference{sandboxControllerRef("owner-name")},
+			},
+			Spec: sandboxv1beta1.SandboxSpec{
+				OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "container", Image: "image"}},
+					},
+				},
+			},
+			Status: sandboxv1beta1.SandboxStatus{
+				PodIPs: []string{"10.0.0.1"},
+				Conditions: []metav1.Condition{{
+					Type:   string(sandboxv1beta1.SandboxConditionReady),
+					Status: metav1.ConditionTrue,
+				}},
+			},
+		}
+	}
+
+	deletionTimestamp := metav1.NewTime(time.Now())
+	tests := []struct {
+		name string
+		edit func(*sandboxv1beta1.Sandbox)
+		want bool
+	}{
+		{
+			name: "status only",
+			edit: func(sandbox *sandboxv1beta1.Sandbox) {
+				sandbox.Status.PodIPs = []string{"10.0.0.2"}
+			},
+			want: false,
+		},
+		{
+			name: "resource version only",
+			edit: func(sandbox *sandboxv1beta1.Sandbox) {
+				sandbox.ResourceVersion = "2"
+			},
+			want: false,
+		},
+		{
+			name: "generation changed",
+			edit: func(sandbox *sandboxv1beta1.Sandbox) {
+				sandbox.Generation = 2
+			},
+			want: true,
+		},
+		{
+			name: "spec changed",
+			edit: func(sandbox *sandboxv1beta1.Sandbox) {
+				sandbox.Spec.PodTemplate.Spec.Containers[0].Image = "other-image"
+			},
+			want: true,
+		},
+		{
+			name: "deletion started",
+			edit: func(sandbox *sandboxv1beta1.Sandbox) {
+				sandbox.DeletionTimestamp = &deletionTimestamp
+			},
+			want: true,
+		},
+		{
+			name: "labels changed",
+			edit: func(sandbox *sandboxv1beta1.Sandbox) {
+				sandbox.Labels["app"] = "updated"
+			},
+			want: true,
+		},
+		{
+			name: "annotations changed",
+			edit: func(sandbox *sandboxv1beta1.Sandbox) {
+				sandbox.Annotations["annotation"] = "updated"
+			},
+			want: true,
+		},
+		{
+			name: "finalizers changed",
+			edit: func(sandbox *sandboxv1beta1.Sandbox) {
+				sandbox.Finalizers = append(sandbox.Finalizers, "other-finalizer")
+			},
+			want: true,
+		},
+		{
+			name: "owner references changed",
+			edit: func(sandbox *sandboxv1beta1.Sandbox) {
+				sandbox.OwnerReferences[0].UID = types.UID("other-owner-uid")
+			},
+			want: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			oldSandbox := baseSandbox()
+			newSandbox := oldSandbox.DeepCopy()
+			tc.edit(newSandbox)
+
+			got := sandboxUpdateAffectsReconcile(oldSandbox, newSandbox)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestSandboxUpdatePredicateLifecycleEvents(t *testing.T) {
+	predicate := sandboxUpdatePredicate()
+
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sandbox-name",
+			Namespace: "sandbox-ns",
+		},
+	}
+
+	require.True(t, predicate.Create(event.CreateEvent{Object: sandbox}))
+	require.True(t, predicate.Delete(event.DeleteEvent{Object: sandbox}))
+	require.False(t, predicate.Generic(event.GenericEvent{Object: sandbox}))
+}
+
 func TestSandboxPodUpdateAffectsReconcile(t *testing.T) {
 	basePod := func() *corev1.Pod {
 		return &corev1.Pod{

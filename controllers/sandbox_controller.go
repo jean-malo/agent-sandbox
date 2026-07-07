@@ -1373,7 +1373,7 @@ func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWorkers
 	}
 
 	controllerBuilder := ctrl.NewControllerManagedBy(mgr).
-		For(&sandboxv1beta1.Sandbox{}).
+		For(&sandboxv1beta1.Sandbox{}, builder.WithPredicates(sandboxUpdatePredicate())).
 		Owns(&corev1.Service{}, builder.WithPredicates(labelSelectorPredicate)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentWorkers})
 
@@ -1385,6 +1385,47 @@ func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWorkers
 	}
 
 	return controllerBuilder.Complete(r)
+}
+
+func sandboxUpdatePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool {
+			return true
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldSandbox, oldOK := e.ObjectOld.(*sandboxv1beta1.Sandbox)
+			newSandbox, newOK := e.ObjectNew.(*sandboxv1beta1.Sandbox)
+			if !oldOK || !newOK {
+				return true
+			}
+			return sandboxUpdateAffectsReconcile(oldSandbox, newSandbox)
+		},
+		DeleteFunc: func(event.DeleteEvent) bool {
+			return true
+		},
+		GenericFunc: func(event.GenericEvent) bool {
+			return false
+		},
+	}
+}
+
+func sandboxUpdateAffectsReconcile(oldSandbox, newSandbox *sandboxv1beta1.Sandbox) bool {
+	if oldSandbox.DeletionTimestamp.IsZero() != newSandbox.DeletionTimestamp.IsZero() {
+		return true
+	}
+	if oldSandbox.Generation != newSandbox.Generation {
+		return true
+	}
+	if !reflect.DeepEqual(oldSandbox.Spec, newSandbox.Spec) {
+		return true
+	}
+	if !maps.Equal(oldSandbox.Labels, newSandbox.Labels) || !maps.Equal(oldSandbox.Annotations, newSandbox.Annotations) {
+		return true
+	}
+	if !reflect.DeepEqual(oldSandbox.Finalizers, newSandbox.Finalizers) {
+		return true
+	}
+	return !reflect.DeepEqual(oldSandbox.OwnerReferences, newSandbox.OwnerReferences)
 }
 
 func sandboxPodUpdatePredicate() predicate.Predicate {
