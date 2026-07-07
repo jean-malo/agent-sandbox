@@ -2265,6 +2265,12 @@ func TestSandboxClaimAdoptionPatchesAssignedAnnotation(t *testing.T) {
 		Spec: sandboxv1beta1.SandboxSpec{
 			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
 			PodTemplate: sandboxv1beta1.PodTemplate{
+				ObjectMeta: sandboxv1beta1.PodMetadata{
+					Labels: map[string]string{
+						warmPoolSandboxLabel:                       sandboxcontrollers.NameHash("test-pool"),
+						sandboxv1beta1.SandboxPodTemplateHashLabel: "pod-template-hash",
+					},
+				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{Name: "test-container", Image: "test-image"}},
 				},
@@ -2402,6 +2408,8 @@ func TestSandboxClaimWarmAdoptionWithoutMetadataSkipsPostAdoptionUpdate(t *testi
 	require.NoError(t, err)
 	require.Equal(t, sandboxv1beta1.SandboxLaunchTypeWarm, updatedSandbox.Labels[sandboxv1beta1.SandboxLaunchTypeLabel])
 	require.NotContains(t, updatedSandbox.Labels, warmPoolSandboxLabel)
+	require.NotContains(t, updatedSandbox.Spec.PodTemplate.ObjectMeta.Labels, warmPoolSandboxLabel)
+	require.NotContains(t, updatedSandbox.Spec.PodTemplate.ObjectMeta.Labels, sandboxv1beta1.SandboxPodTemplateHashLabel)
 	require.Equal(t, "claim-uid", updatedSandbox.Spec.PodTemplate.ObjectMeta.Labels[extensionsv1beta1.SandboxIDLabel])
 }
 
