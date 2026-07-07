@@ -97,6 +97,108 @@ func TestWarmPoolPrimaryPredicateIgnoresStatusOnlyUpdates(t *testing.T) {
 	}))
 }
 
+func TestWarmPoolSandboxPredicateFiltersStatusOnlyUpdates(t *testing.T) {
+	pred := warmPoolSandboxPredicate()
+	poolName := "test-pool"
+	namespace := "default"
+	template := createTemplate(namespace)
+	poolNameHash := sandboxcontrollers.NameHash(poolName)
+
+	oldSandbox := createPoolSandbox(poolName, namespace, poolNameHash, template, "-abc123")
+	oldSandbox.Generation = 1
+	controller := true
+	oldSandbox.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion: extensionsv1beta1.GroupVersion.String(),
+			Kind:       "SandboxWarmPool",
+			Name:       poolName,
+			UID:        "pool-uid",
+			Controller: &controller,
+		},
+	}
+
+	statusUpdate := oldSandbox.DeepCopy()
+	statusUpdate.ResourceVersion = "2"
+	statusUpdate.Status.Conditions = []metav1.Condition{
+		{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: metav1.ConditionTrue,
+		},
+	}
+	require.False(t, pred.Update(event.UpdateEvent{
+		ObjectOld: oldSandbox,
+		ObjectNew: statusUpdate,
+	}))
+
+	specUpdate := oldSandbox.DeepCopy()
+	specUpdate.ResourceVersion = "3"
+	specUpdate.Generation = 2
+	require.True(t, pred.Update(event.UpdateEvent{
+		ObjectOld: oldSandbox,
+		ObjectNew: specUpdate,
+	}))
+
+	adoptedSandbox := oldSandbox.DeepCopy()
+	adoptedSandbox.ResourceVersion = "4"
+	delete(adoptedSandbox.Labels, warmPoolSandboxLabel)
+	adoptedSandbox.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion: extensionsv1beta1.GroupVersion.String(),
+			Kind:       "SandboxClaim",
+			Name:       "claim",
+			UID:        "claim-uid",
+			Controller: &controller,
+		},
+	}
+	require.True(t, pred.Update(event.UpdateEvent{
+		ObjectOld: oldSandbox,
+		ObjectNew: adoptedSandbox,
+	}))
+
+	require.False(t, pred.Create(event.CreateEvent{Object: oldSandbox}))
+	require.True(t, pred.Delete(event.DeleteEvent{Object: oldSandbox}))
+}
+
+func TestReconcilePoolRequeuesWhileUnderProvisioned(t *testing.T) {
+	poolName := "test-pool"
+	namespace := "default"
+	templateName := "test-template"
+	template := createTemplate(namespace)
+	scheme := newTestScheme()
+
+	warmPool := &extensionsv1beta1.SandboxWarmPool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      poolName,
+			Namespace: namespace,
+			UID:       "warmpool-uid-123",
+		},
+		Spec: extensionsv1beta1.SandboxWarmPoolSpec{
+			Replicas: 3,
+			TemplateRef: extensionsv1beta1.SandboxTemplateRef{
+				Name: templateName,
+			},
+		},
+	}
+
+	r := SandboxWarmPoolReconciler{
+		Client: fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithRuntimeObjects(template).
+			Build(),
+		Scheme:       scheme,
+		MaxBatchSize: 1,
+	}
+
+	result, err := r.reconcilePool(context.Background(), warmPool)
+	require.NoError(t, err)
+	require.Equal(t, warmPoolCreateCooldown, result.RequeueAfter)
+
+	list := &sandboxv1beta1.SandboxList{}
+	err = r.List(context.Background(), list, client.InNamespace(namespace))
+	require.NoError(t, err)
+	require.Len(t, list.Items, 1)
+}
+
 func createPoolSandbox(poolName, namespace, poolNameHash string, template *extensionsv1beta1.SandboxTemplate, suffix string) *sandboxv1beta1.Sandbox {
 	templateRefHash := ""
 	var podTemplateHash string
@@ -254,10 +356,10 @@ func TestReconcilePool(t *testing.T) {
 
 			ctx := context.Background()
 
-			err := r.reconcilePool(ctx, warmPool)
+			_, err := r.reconcilePool(ctx, warmPool)
 			require.NoError(t, err)
 
-			err = r.reconcilePool(ctx, warmPool)
+			_, err = r.reconcilePool(ctx, warmPool)
 			require.NoError(t, err)
 
 			// Verify final state - count sandboxes with correct warm pool label
@@ -393,10 +495,10 @@ func TestReconcilePoolControllerRef(t *testing.T) {
 
 			ctx := context.Background()
 
-			err := r.reconcilePool(ctx, warmPool)
+			_, err := r.reconcilePool(ctx, warmPool)
 			require.NoError(t, err)
 
-			err = r.reconcilePool(ctx, warmPool)
+			_, err = r.reconcilePool(ctx, warmPool)
 			require.NoError(t, err)
 
 			list := &sandboxv1beta1.SandboxList{}
@@ -485,7 +587,7 @@ func TestPoolLabelValueInIntegration(t *testing.T) {
 
 		expectedPoolNameHash := sandboxcontrollers.NameHash(poolName)
 
-		err := r.reconcilePool(ctx, warmPool)
+		_, err := r.reconcilePool(ctx, warmPool)
 		require.NoError(t, err)
 
 		list := &sandboxv1beta1.SandboxList{}
@@ -583,7 +685,7 @@ func TestCreatePoolSandboxPropagatesVolumeClaimTemplates(t *testing.T) {
 		MaxBatchSize: sandboxCreateDeleteMaxBatchSize,
 	}
 
-	err := r.reconcilePool(ctx, warmPool)
+	_, err := r.reconcilePool(ctx, warmPool)
 	require.NoError(t, err)
 
 	list := &sandboxv1beta1.SandboxList{}
@@ -682,7 +784,7 @@ func TestCreatePoolSandboxAppliesSecureDefaults(t *testing.T) {
 				MaxBatchSize: sandboxCreateDeleteMaxBatchSize,
 			}
 
-			err := r.reconcilePool(ctx, warmPool)
+			_, err := r.reconcilePool(ctx, warmPool)
 			require.NoError(t, err)
 
 			list := &sandboxv1beta1.SandboxList{}
@@ -798,9 +900,9 @@ func TestReconcilePoolReadyReplicas(t *testing.T) {
 
 			ctx := context.Background()
 
-			err := r.reconcilePool(ctx, warmPool)
+			_, err := r.reconcilePool(ctx, warmPool)
 			require.NoError(t, err)
-			err = r.reconcilePool(ctx, warmPool)
+			_, err = r.reconcilePool(ctx, warmPool)
 			require.NoError(t, err)
 
 			require.Equal(t, tc.expectedReadyReplicas, warmPool.Status.ReadyReplicas)
@@ -859,7 +961,7 @@ func TestReconcilePoolGCStuckSandboxes(t *testing.T) {
 		}
 
 		ctx := context.Background()
-		err := r.reconcilePool(ctx, warmPool)
+		_, err := r.reconcilePool(ctx, warmPool)
 		require.NoError(t, err)
 
 		// The stuck sandbox should be deleted and replaced
@@ -892,7 +994,7 @@ func TestReconcilePoolGCStuckSandboxes(t *testing.T) {
 		}
 
 		ctx := context.Background()
-		err := r.reconcilePool(ctx, warmPool)
+		_, err := r.reconcilePool(ctx, warmPool)
 		require.NoError(t, err)
 
 		// Both should be kept (one healthy, one still within grace period)
@@ -928,7 +1030,7 @@ func TestReconcilePoolGCStuckSandboxes(t *testing.T) {
 		}
 
 		ctx := context.Background()
-		err := r.reconcilePool(ctx, warmPool)
+		_, err := r.reconcilePool(ctx, warmPool)
 		require.NoError(t, err)
 
 		remainingOriginalStuck := 0
@@ -1027,7 +1129,7 @@ func TestReconcilePool_TemplateUpdateRollout(t *testing.T) {
 			ctx := context.Background()
 
 			// Initial reconciliation to create the sandboxes
-			err := r.reconcilePool(ctx, warmPool)
+			_, err := r.reconcilePool(ctx, warmPool)
 			require.NoError(t, err)
 
 			// Get initial hash label
@@ -1056,7 +1158,7 @@ func TestReconcilePool_TemplateUpdateRollout(t *testing.T) {
 			require.NotEqual(t, initialHash, updatedHash, "Hashes should differ after template update")
 
 			// Reconcile again to trigger rollout (or lack thereof)
-			err = r.reconcilePool(ctx, warmPool)
+			_, err = r.reconcilePool(ctx, warmPool)
 			require.NoError(t, err)
 
 			// Verify state after update
@@ -1085,7 +1187,7 @@ func TestReconcilePool_TemplateUpdateRollout(t *testing.T) {
 				require.NoError(t, err)
 
 				// Reconcile to trigger replenishment
-				err = r.reconcilePool(ctx, warmPool)
+				_, err = r.reconcilePool(ctx, warmPool)
 				require.NoError(t, err)
 
 				// Verify that we have 2 sandboxes: one old (v1) and one new (v2)
@@ -1173,7 +1275,7 @@ func TestReconcilePool_TemplateRefUpdate_SameSpec(t *testing.T) {
 	ctx := context.Background()
 
 	// Initial reconcile
-	err := r.reconcilePool(ctx, warmPool)
+	_, err := r.reconcilePool(ctx, warmPool)
 	require.NoError(t, err)
 
 	sandboxes := &sandboxv1beta1.SandboxList{}
@@ -1207,7 +1309,7 @@ func TestReconcilePool_TemplateRefUpdate_SameSpec(t *testing.T) {
 	require.NoError(t, err)
 
 	// Reconcile again to trigger rollout
-	err = r.reconcilePool(ctx, warmPool)
+	_, err = r.reconcilePool(ctx, warmPool)
 	require.NoError(t, err)
 
 	// Verify state after update
@@ -1438,7 +1540,7 @@ func TestReconcilePool_TemplateUpdate_DNSPolicy(t *testing.T) {
 	}
 
 	// Initial reconcile to create sandboxes
-	err := r.reconcilePool(ctx, warmPool)
+	_, err := r.reconcilePool(ctx, warmPool)
 	require.NoError(t, err)
 
 	// Verify initial state
@@ -1457,7 +1559,7 @@ func TestReconcilePool_TemplateUpdate_DNSPolicy(t *testing.T) {
 	require.NoError(t, err)
 
 	// Reconcile again, should trigger rollout (deletion and recreation)
-	err = r.reconcilePool(ctx, warmPool)
+	_, err = r.reconcilePool(ctx, warmPool)
 	require.NoError(t, err)
 
 	// Verify that sandboxes now have the updated DNSPolicy
@@ -1714,7 +1816,7 @@ func TestReconcilePool_EvictionOverride(t *testing.T) {
 				EnableWarmPoolEviction: tc.controllerEnable,
 			}
 
-			err := r.reconcilePool(ctx, warmPool)
+			_, err := r.reconcilePool(ctx, warmPool)
 			require.NoError(t, err)
 
 			list := &sandboxv1beta1.SandboxList{}

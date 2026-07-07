@@ -96,7 +96,8 @@ func (r *SandboxWarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	oldStatus := warmPool.Status.DeepCopy()
 
 	// Reconcile the pool (create or delete Sandboxes as needed)
-	if err := r.reconcilePool(ctx, warmPool); err != nil {
+	result, err := r.reconcilePool(ctx, warmPool)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -106,12 +107,13 @@ func (r *SandboxWarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, nil
+	return result, nil
 }
 
 // reconcilePool ensures the correct number of pre-allocated sandboxes exist in the pool.
-func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool *extensionsv1beta1.SandboxWarmPool) error {
+func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool *extensionsv1beta1.SandboxWarmPool) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	result := ctrl.Result{}
 
 	// Compute hash of the warm pool name for the pool label
 	poolNameHash := sandboxcontrollers.NameHash(warmPool.Name)
@@ -127,7 +129,7 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 		Namespace:     warmPool.Namespace,
 	}); err != nil {
 		logger.Error(err, "Failed to list sandboxes")
-		return err
+		return result, err
 	}
 
 	// Fetch template and compute hash once to avoid repeated expensive operations
@@ -146,6 +148,7 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 		if !isSandboxReady(&sb) && !sb.CreationTimestamp.IsZero() && now.Sub(sb.CreationTimestamp.Time) > warmPoolReadinessGracePeriod {
 			if stuckSandboxesDeleted >= maxBatchSize {
 				healthySandboxes = append(healthySandboxes, sb)
+				result = soonerRequeue(result, warmPoolCreateCooldown)
 				continue
 			}
 			logger.Info("Deleting stuck warm pool sandbox",
@@ -156,7 +159,11 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 				allErrors = errors.Join(allErrors, err)
 			}
 			stuckSandboxesDeleted++
+			result = soonerRequeue(result, warmPoolCreateCooldown)
 			continue
+		}
+		if !isSandboxReady(&sb) && !sb.CreationTimestamp.IsZero() {
+			result = soonerRequeue(result, warmPoolReadinessGracePeriod-now.Sub(sb.CreationTimestamp.Time))
 		}
 		healthySandboxes = append(healthySandboxes, sb)
 	}
@@ -186,6 +193,7 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 	// Create new sandboxes if we need more
 	if currentReplicas < desiredReplicas && tmplErr == nil {
 		sandboxesToCreate := min(desiredReplicas-currentReplicas, maxBatchSize)
+		result = soonerRequeue(result, warmPoolCreateCooldown)
 		templateVersion := SandboxTemplateRefHash(warmPool.Spec.TemplateRef.Name) + "/" + currentPodTemplateHash
 		if !r.reserveCreateBatch(warmPool, templateVersion, now) {
 			logger.Info(
@@ -216,6 +224,7 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 	// Delete excess sandboxes if we have too many
 	if currentReplicas > desiredReplicas {
 		sandboxesToDelete := min(currentReplicas-desiredReplicas, maxBatchSize)
+		result = soonerRequeue(result, warmPoolCreateCooldown)
 		logger.Info("Deleting excess sandboxes", "count", sandboxesToDelete)
 
 		// Prioritize deleting unready sandboxes before ready ones,
@@ -247,7 +256,17 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 		allErrors = errors.Join(allErrors, tmplErr)
 	}
 
-	return allErrors
+	return result, allErrors
+}
+
+func soonerRequeue(result ctrl.Result, delay time.Duration) ctrl.Result {
+	if delay <= 0 {
+		delay = immediateRequeueDelay
+	}
+	if result.RequeueAfter == 0 || delay < result.RequeueAfter {
+		result.RequeueAfter = delay
+	}
+	return result
 }
 
 func (r *SandboxWarmPoolReconciler) reserveCreateBatch(warmPool *extensionsv1beta1.SandboxWarmPool, templateVersion string, now time.Time) bool {
@@ -597,6 +616,67 @@ func warmPoolPrimaryPredicate() predicate.Predicate {
 	return predicate.GenerationChangedPredicate{}
 }
 
+func warmPoolSandboxPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool {
+			// Reconcile explicitly requeues after create batches. Reacting to each
+			// child create/update would full-scan large pools thousands of times.
+			return false
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldSandbox, oldOk := e.ObjectOld.(*sandboxv1beta1.Sandbox)
+			newSandbox, newOk := e.ObjectNew.(*sandboxv1beta1.Sandbox)
+			if !oldOk || !newOk {
+				return false
+			}
+			return warmPoolSandboxUpdateAffectsPool(oldSandbox, newSandbox)
+		},
+		DeleteFunc: func(event.DeleteEvent) bool {
+			return true
+		},
+		GenericFunc: func(event.GenericEvent) bool {
+			return false
+		},
+	}
+}
+
+func warmPoolSandboxUpdateAffectsPool(oldSandbox, newSandbox *sandboxv1beta1.Sandbox) bool {
+	if oldSandbox.Generation != newSandbox.Generation {
+		return true
+	}
+	if oldSandbox.DeletionTimestamp.IsZero() != newSandbox.DeletionTimestamp.IsZero() {
+		return true
+	}
+
+	for _, key := range []string{
+		warmPoolSandboxLabel,
+		sandboxTemplateRefHash,
+		sandboxv1beta1.SandboxPodTemplateHashLabel,
+	} {
+		if oldSandbox.Labels[key] != newSandbox.Labels[key] {
+			return true
+		}
+	}
+
+	oldName, oldUID, oldHasWarmPoolController := warmPoolControllerRefIdentity(oldSandbox)
+	newName, newUID, newHasWarmPoolController := warmPoolControllerRefIdentity(newSandbox)
+	if oldHasWarmPoolController != newHasWarmPoolController {
+		return true
+	}
+	return oldHasWarmPoolController && (oldName != newName || oldUID != newUID)
+}
+
+func warmPoolControllerRefIdentity(sandbox *sandboxv1beta1.Sandbox) (string, types.UID, bool) {
+	controllerRef := metav1.GetControllerOf(sandbox)
+	if controllerRef == nil {
+		return "", "", false
+	}
+	if controllerRef.APIVersion != extensionsv1beta1.GroupVersion.String() || controllerRef.Kind != "SandboxWarmPool" {
+		return "", "", false
+	}
+	return controllerRef.Name, controllerRef.UID, true
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *SandboxWarmPoolReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWorkers int) error {
 	if r.MaxBatchSize <= 0 {
@@ -616,14 +696,7 @@ func (r *SandboxWarmPoolReconciler) SetupWithManager(mgr ctrl.Manager, concurren
 		For(&extensionsv1beta1.SandboxWarmPool{}, builder.WithPredicates(warmPoolPrimaryPredicate())).
 		Owns(
 			&sandboxv1beta1.Sandbox{},
-			builder.WithPredicates(predicate.Funcs{
-				CreateFunc: func(event.CreateEvent) bool {
-					// The pool creates Sandboxes in batches. Requeueing on those
-					// create events can run before the cache observes the batch and
-					// cause duplicate refill batches.
-					return false
-				},
-			}),
+			builder.WithPredicates(warmPoolSandboxPredicate()),
 		).
 		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentWorkers}).
 		Watches(
