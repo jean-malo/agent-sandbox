@@ -149,13 +149,6 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, fmt.Errorf("failed to get sandbox claim %q: %w", req.NamespacedName, err)
 	}
 
-	// Unconditionally clean up legacy per-claim NetworkPolicies.
-	// We log the error but do not block the main reconcile flow so
-	// transient API issues don't prevent Sandbox adoption/creation.
-	if err := r.cleanupLegacyNetworkPolicy(ctx, claim); err != nil {
-		logger.Error(err, "Non-fatal error cleaning up legacy per-claim NetworkPolicy")
-	}
-
 	// Start Tracing Span
 	ctx, end := r.Tracer.StartSpan(ctx, claim, "ReconcileSandboxClaim", nil)
 	defer end()
@@ -248,6 +241,13 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	r.recordCreationLatencyMetric(ctx, claim, originalClaimStatus, sandbox)
 
+	// Legacy NetworkPolicies are cleanup-only. Keep that API/cache lookup off
+	// the adoption path so new warm-pool claims can publish their assigned
+	// sandbox before the controller does migration housekeeping.
+	if err := r.cleanupLegacyNetworkPolicy(ctx, claim); err != nil {
+		logger.Error(err, "Non-fatal error cleaning up legacy per-claim NetworkPolicy")
+	}
+
 	// Determine Result
 	var result ctrl.Result
 	if !claimExpired {
@@ -285,24 +285,18 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return result, reconcileErr
 }
 
-// initializeAnnotations initializes trace ID and observation time for active resources missing them.
+// initializeAnnotations initializes trace context for active resources missing it.
 func (r *SandboxClaimReconciler) initializeAnnotations(ctx context.Context, claim *extensionsv1beta1.SandboxClaim) error {
 	traceContext := r.Tracer.GetTraceContext(ctx)
-	needObservabilityPatch := claim.Annotations[asmetrics.ObservabilityAnnotation] == ""
+	r.getOrRecordObservedTime(claim)
 	needTraceContextPatch := traceContext != "" && (claim.Annotations[asmetrics.TraceContextAnnotation] == "")
 
-	if needObservabilityPatch || needTraceContextPatch {
+	if needTraceContextPatch {
 		patch := client.MergeFrom(claim.DeepCopy())
 		if claim.Annotations == nil {
 			claim.Annotations = make(map[string]string)
 		}
-		if needObservabilityPatch {
-			timestamp := r.getOrRecordObservedTime(claim)
-			claim.Annotations[asmetrics.ObservabilityAnnotation] = timestamp.Format(time.RFC3339Nano)
-		}
-		if needTraceContextPatch {
-			claim.Annotations[asmetrics.TraceContextAnnotation] = traceContext
-		}
+		claim.Annotations[asmetrics.TraceContextAnnotation] = traceContext
 		if err := r.Patch(ctx, claim, patch); err != nil {
 			return err
 		}
@@ -736,10 +730,6 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 
 			logger.Info("Successfully adopted sandbox from warm pool", "sandbox", adopted.Name, "claim", claim.Name)
 
-			if r.Recorder != nil {
-				r.Recorder.Eventf(claim, nil, corev1.EventTypeNormal, "SandboxAdopted", "Adoption", "Adopted warm pool Sandbox %q", adopted.Name)
-			}
-
 			podCondition := "not_ready"
 			if isSandboxReady(adopted) {
 				podCondition = "ready"
@@ -857,21 +847,36 @@ func (r *SandboxClaimReconciler) completeAdoption(ctx context.Context, claim *ex
 	adopted.Labels = ensureClaimIdentityLabels(adopted.Labels, claim)
 	adopted.Spec.PodTemplate.ObjectMeta.Labels = ensureClaimIdentityLabels(adopted.Spec.PodTemplate.ObjectMeta.Labels, claim)
 
-	// Resolve the template hash and metadata used by reconcileActive.
-	template, templateErr := r.getTemplate(ctx, claim)
-	if templateHash == "" && template != nil {
-		templateHash = SandboxTemplateRefHash(template.Name)
-	} else if templateHash == "" && templateErr != nil {
-		log.FromContext(ctx).V(1).Info("Unable to set template ref hash label during adoption because template lookup failed", "sandbox", adopted.Name, "claim", claim.Name, "error", templateErr.Error())
-	}
+	if hasAdditionalPodMetadata(&claim.Spec.AdditionalPodMetadata) {
+		// Resolve the template metadata when the claim actually contributes
+		// user metadata. The common default warm-pool path has no additional
+		// metadata, so it can avoid two cache reads and a full metadata rebuild.
+		template, templateErr := r.getTemplate(ctx, claim)
+		if templateHash == "" && template != nil {
+			templateHash = SandboxTemplateRefHash(template.Name)
+		} else if templateHash == "" && templateErr != nil {
+			log.FromContext(ctx).V(1).Info("Unable to set template ref hash label during adoption because template lookup failed", "sandbox", adopted.Name, "claim", claim.Name, "error", templateErr.Error())
+		}
 
-	// Keep the template ref hash on the adopted sandbox's top-level labels so
-	// discovery by template hash keeps working after adoption.
-	if templateHash != "" {
-		adopted.Labels[sandboxTemplateRefHash] = templateHash
-	}
+		// Keep the template ref hash on the adopted sandbox's top-level labels so
+		// discovery by template hash keeps working after adoption.
+		if templateHash != "" {
+			adopted.Labels[sandboxTemplateRefHash] = templateHash
+		}
+		if templateErr != nil || template == nil {
+			if templateHash != "" {
+				adopted.Spec.PodTemplate.ObjectMeta.Labels[sandboxTemplateRefHash] = templateHash
+			}
 
-	if templateErr == nil && template != nil {
+			if err := r.mergePodMetadata(&adopted.Spec.PodTemplate.ObjectMeta, &claim.Spec.AdditionalPodMetadata); err != nil {
+				return err
+			}
+			if err := r.Patch(ctx, adopted, client.MergeFrom(originalAdopted)); err != nil {
+				return err
+			}
+			return nil
+		}
+
 		var mergedMeta v1beta1.PodMetadata
 		template.Spec.PodTemplate.ObjectMeta.DeepCopyInto(&mergedMeta)
 
@@ -890,13 +895,9 @@ func (r *SandboxClaimReconciler) completeAdoption(ctx context.Context, claim *ex
 		// Force an exact match
 		adopted.Spec.PodTemplate.ObjectMeta = mergedMeta
 	} else {
-		// Fallback (just in case template is somehow missing)
 		if templateHash != "" {
+			adopted.Labels[sandboxTemplateRefHash] = templateHash
 			adopted.Spec.PodTemplate.ObjectMeta.Labels[sandboxTemplateRefHash] = templateHash
-		}
-
-		if err := r.mergePodMetadata(&adopted.Spec.PodTemplate.ObjectMeta, &claim.Spec.AdditionalPodMetadata); err != nil {
-			return err
 		}
 	}
 
@@ -905,6 +906,10 @@ func (r *SandboxClaimReconciler) completeAdoption(ctx context.Context, claim *ex
 	}
 
 	return nil
+}
+
+func hasAdditionalPodMetadata(meta *v1beta1.PodMetadata) bool {
+	return meta != nil && (len(meta.Labels) > 0 || len(meta.Annotations) > 0)
 }
 
 // isSandboxReady checks if a sandbox has Ready=True condition.
@@ -1610,8 +1615,8 @@ func (r *SandboxClaimReconciler) recordClaimStartupLatency(ctx context.Context, 
 // recordControllerStartupLatency records the controller startup latency based on observed time.
 func (r *SandboxClaimReconciler) recordControllerStartupLatency(ctx context.Context, claim *extensionsv1beta1.SandboxClaim, launchType string, templateName string) {
 	logger := log.FromContext(ctx)
+	key := types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}
 	if observedTimeString := claim.Annotations[asmetrics.ObservabilityAnnotation]; observedTimeString != "" {
-		key := types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}
 		defer r.observedTimes.Delete(key)
 
 		observedTime, err := time.Parse(time.RFC3339Nano, observedTimeString)
@@ -1620,7 +1625,16 @@ func (r *SandboxClaimReconciler) recordControllerStartupLatency(ctx context.Cont
 			return
 		}
 		asmetrics.RecordClaimControllerStartupLatency(observedTime, launchType, templateName)
+		return
 	}
+
+	entry, ok := r.observedTimes.Load(key)
+	if !ok || entry.uid != claim.UID {
+		logger.V(1).Info("Controller first seen timestamp missing, skipping ClaimControllerStartupLatency metric", "claim", claim.Name)
+		return
+	}
+	defer r.observedTimes.Delete(key)
+	asmetrics.RecordClaimControllerStartupLatency(entry.timestamp, launchType, templateName)
 }
 
 // recordSandboxCreationLatency records the sandbox creation latency.
