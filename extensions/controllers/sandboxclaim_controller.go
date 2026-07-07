@@ -58,6 +58,7 @@ import (
 
 const ObservabilityAnnotation = "agents.x-k8s.io/controller-first-observed-at"
 const immediateRequeueDelay = time.Millisecond
+const completedAdoptionCacheTTL = 30 * time.Second
 
 // ErrTemplateNotFound is a sentinel error indicating a SandboxTemplate was not found.
 var ErrTemplateNotFound = errors.New("SandboxTemplate not found")
@@ -109,6 +110,54 @@ func (m *observedTimeMap) LoadOrStore(key types.NamespacedName, entry observedTi
 	return actual.(observedTimeEntry), loaded
 }
 
+type completedAdoptionKey struct {
+	namespace   string
+	claimName   string
+	claimUID    types.UID
+	sandboxName string
+}
+
+type completedAdoptionMap struct {
+	inner sync.Map
+}
+
+func completedAdoptionKeyFor(claim *extensionsv1beta1.SandboxClaim, sandboxName string) completedAdoptionKey {
+	return completedAdoptionKey{
+		namespace:   claim.Namespace,
+		claimName:   claim.Name,
+		claimUID:    claim.UID,
+		sandboxName: sandboxName,
+	}
+}
+
+func (m *completedAdoptionMap) Store(claim *extensionsv1beta1.SandboxClaim, sandboxName string, completedAt time.Time) {
+	m.inner.Store(completedAdoptionKeyFor(claim, sandboxName), completedAt)
+}
+
+func (m *completedAdoptionMap) RecentlyCompleted(claim *extensionsv1beta1.SandboxClaim, sandboxName string, now time.Time) bool {
+	key := completedAdoptionKeyFor(claim, sandboxName)
+	rawCompletedAt, ok := m.inner.Load(key)
+	if !ok {
+		return false
+	}
+	completedAt := rawCompletedAt.(time.Time)
+	if now.Sub(completedAt) <= completedAdoptionCacheTTL {
+		return true
+	}
+	m.inner.Delete(key)
+	return false
+}
+
+func (m *completedAdoptionMap) DeleteClaim(namespace string, name string, uid types.UID) {
+	m.inner.Range(func(rawKey any, _ any) bool {
+		key := rawKey.(completedAdoptionKey)
+		if key.namespace == namespace && key.claimName == name && (uid == "" || key.claimUID == uid) {
+			m.inner.Delete(key)
+		}
+		return true
+	})
+}
+
 // SandboxClaimReconciler reconciles a SandboxClaim object.
 type SandboxClaimReconciler struct {
 	client.Client
@@ -118,6 +167,7 @@ type SandboxClaimReconciler struct {
 	Tracer                  asmetrics.Instrumenter
 	MaxConcurrentReconciles int
 	observedTimes           observedTimeMap
+	completedAdoptions      completedAdoptionMap
 	AllowedLabelDomains     []string
 	queueRebuilds           singleflight.Group
 }
@@ -143,6 +193,7 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if k8errors.IsNotFound(err) {
 			// Fallback cleanup to prevent memory leaks if the delete predicate was missed or a stale request is processed.
 			r.observedTimes.Delete(req.NamespacedName)
+			r.completedAdoptions.DeleteClaim(req.Namespace, req.Name, claim.UID)
 			logger.V(1).Info("SandboxClaim not found, ignoring", "request", req.NamespacedName)
 			return ctrl.Result{}, nil
 		}
@@ -733,6 +784,7 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 				logger.Error(err, "Failed to complete adoption for candidate sandbox", "sandbox candidate", adopted.Name, "claim", claim.Name)
 				return false, err
 			}
+			r.completedAdoptions.Store(claim, adopted.Name, time.Now())
 
 			logger.Info("Successfully adopted sandbox from warm pool", "sandbox", adopted.Name, "claim", claim.Name)
 
@@ -809,10 +861,7 @@ func (r *SandboxClaimReconciler) rebuildWarmSandboxQueueOnce(ctx context.Context
 	return count, nil
 }
 
-func (r *SandboxClaimReconciler) completeAdoption(ctx context.Context, claim *extensionsv1beta1.SandboxClaim, adopted *v1beta1.Sandbox) error {
-	// Take a snapshot of the sandbox BEFORE we mutate it to generate a clean JSON Patch.
-	originalAdopted := adopted.DeepCopy()
-
+func (r *SandboxClaimReconciler) prepareAdoptedSandbox(ctx context.Context, claim *extensionsv1beta1.SandboxClaim, adopted *v1beta1.Sandbox) error {
 	templateHash := adopted.Labels[sandboxTemplateRefHash]
 
 	// Remove warm pool labels so the sandbox no longer appears in warm pool queries
@@ -881,10 +930,6 @@ func (r *SandboxClaimReconciler) completeAdoption(ctx context.Context, claim *ex
 			if err := r.mergePodMetadata(&adopted.Spec.PodTemplate.ObjectMeta, &claim.Spec.AdditionalPodMetadata); err != nil {
 				return err
 			}
-			if err := r.Patch(ctx, adopted, client.MergeFrom(originalAdopted)); err != nil {
-				return err
-			}
-			return nil
 		}
 
 		var mergedMeta v1beta1.PodMetadata
@@ -909,6 +954,15 @@ func (r *SandboxClaimReconciler) completeAdoption(ctx context.Context, claim *ex
 			adopted.Labels[sandboxTemplateRefHash] = templateHash
 			adopted.Spec.PodTemplate.ObjectMeta.Labels[sandboxTemplateRefHash] = templateHash
 		}
+	}
+	return nil
+}
+
+func (r *SandboxClaimReconciler) completeAdoption(ctx context.Context, claim *extensionsv1beta1.SandboxClaim, adopted *v1beta1.Sandbox) error {
+	// Take a snapshot of the sandbox BEFORE we mutate it to generate a clean JSON Patch.
+	originalAdopted := adopted.DeepCopy()
+	if err := r.prepareAdoptedSandbox(ctx, claim, adopted); err != nil {
+		return err
 	}
 
 	if err := r.Patch(ctx, adopted, client.MergeFrom(originalAdopted)); err != nil {
@@ -1302,6 +1356,13 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 
 			controllerRef := metav1.GetControllerOf(sandbox)
 			if controllerRef != nil && controllerRef.Kind == "SandboxWarmPool" {
+				if r.completedAdoptions.RecentlyCompleted(claim, sbName, time.Now()) {
+					logger.V(1).Info("Skipping repeated warm pool adoption completion during cache lag", "sandbox", sbName, "claim", claim.Name)
+					if err := r.prepareAdoptedSandbox(ctx, claim, sandbox); err != nil {
+						return nil, fmt.Errorf("failed to prepare recently adopted sandbox %q: %w", sbName, err)
+					}
+					return sandbox, nil
+				}
 				// Still in warm pool. Try to complete adoption!
 				logger.Info("Sandbox found in claim metadata still in warm pool, trying to complete adoption", "sandbox", sbName, "claim", claim.Name)
 				if err := verifySandboxCandidate(sandbox, claim); err != nil {
@@ -1323,6 +1384,7 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 							return nil, fmt.Errorf("failed to complete adoption of %q: %w", sbName, err)
 						}
 					} else {
+						r.completedAdoptions.Store(claim, sandbox.Name, time.Now())
 						if fromLabel {
 							if err := r.migrateLegacyAssignedSandboxLabel(ctx, claim, sbName); err != nil {
 								logger.Error(err, "Failed to migrate legacy sandbox label to annotation during adoption completion", "claim", claim.Name)
@@ -1494,6 +1556,7 @@ func (r *SandboxClaimReconciler) getTimingPredicate() predicate.Funcs {
 			if ok && entry.uid == e.Object.GetUID() {
 				r.observedTimes.Delete(key)
 			}
+			r.completedAdoptions.DeleteClaim(e.Object.GetNamespace(), e.Object.GetName(), e.Object.GetUID())
 			return true
 		},
 	}

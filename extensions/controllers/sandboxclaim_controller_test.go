@@ -3765,6 +3765,90 @@ func TestSandboxClaimCompletesAssignedWarmPoolAdoption(t *testing.T) {
 	}
 }
 
+func TestSandboxClaimSkipsRepeatedAssignedWarmPoolAdoptionDuringCacheLag(t *testing.T) {
+	scheme := newScheme(t)
+
+	claim := &extensionsv1beta1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-claim",
+			Namespace: "default",
+			UID:       "claim-uid-123",
+			Annotations: map[string]string{
+				extensionsv1beta1.AssignedSandboxNameAnnotation: "adopted-sb",
+			},
+		},
+		Spec: extensionsv1beta1.SandboxClaimSpec{
+			WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: "test-pool"},
+		},
+	}
+
+	adoptedSandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "adopted-sb",
+			Namespace: "default",
+			Labels: map[string]string{
+				extensionsv1beta1.SandboxIDLabel: "claim-uid-123",
+				sandboxTemplateRefHash:           sandboxcontrollers.NameHash("test-template"),
+				warmPoolSandboxLabel:             sandboxcontrollers.NameHash("test-pool"),
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "extensions.agents.x-k8s.io/v1beta1",
+				Kind:       "SandboxWarmPool",
+				Name:       "test-pool",
+				UID:        "warmpool-uid-123",
+				Controller: ptr.To(true), // nolint:modernize
+			}},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				ObjectMeta: sandboxv1beta1.PodMetadata{
+					Labels: map[string]string{
+						extensionsv1beta1.SandboxIDLabel: "claim-uid-123",
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(claim, adoptedSandbox).
+		WithStatusSubresource(claim).
+		Build()
+
+	reconciler := &SandboxClaimReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		Recorder:         events.NewFakeRecorder(10),
+		Tracer:           asmetrics.NewNoOp(),
+		WarmSandboxQueue: queue.NewSimpleSandboxQueue(),
+	}
+	reconciler.completedAdoptions.Store(claim, adoptedSandbox.Name, time.Now())
+
+	sandbox, err := reconciler.getOrCreateSandbox(context.Background(), claim, nil)
+	require.NoError(t, err)
+	require.NotNil(t, sandbox)
+	require.Equal(t, "adopted-sb", sandbox.Name)
+	if _, ok := sandbox.Labels[warmPoolSandboxLabel]; ok {
+		t.Fatal("returned sandbox should have warm pool label removed")
+	}
+	require.Equal(t, sandboxv1beta1.SandboxLaunchTypeWarm, sandbox.Labels[sandboxv1beta1.SandboxLaunchTypeLabel])
+	controllerRef := metav1.GetControllerOf(sandbox)
+	require.NotNil(t, controllerRef)
+	require.Equal(t, "SandboxClaim", controllerRef.Kind)
+	require.Equal(t, "test-claim", controllerRef.Name)
+
+	var stored sandboxv1beta1.Sandbox
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Name: "adopted-sb", Namespace: "default"}, &stored)
+	require.NoError(t, err)
+	storedControllerRef := metav1.GetControllerOf(&stored)
+	require.NotNil(t, storedControllerRef)
+	require.Equal(t, "SandboxWarmPool", storedControllerRef.Kind)
+	if _, ok := stored.Labels[warmPoolSandboxLabel]; !ok {
+		t.Fatal("stored sandbox should be unchanged; cache-lag skip must not patch again")
+	}
+}
+
 func TestSandboxClaimPreventsAdoptionFromWrongWarmPool(t *testing.T) {
 	scheme := newScheme(t)
 
