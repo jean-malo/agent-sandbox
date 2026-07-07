@@ -3162,7 +3162,11 @@ func TestSandboxClaimTimingPredicates(t *testing.T) {
 				r.observedTimes.Store(key, observedTimeEntry{timestamp: time.Now(), uid: "uid-1"})
 			},
 			trigger: func(p predicate.Predicate) bool {
-				return p.Update(event.UpdateEvent{ObjectNew: claim1, ObjectOld: claim1})
+				updated := claim1.DeepCopy()
+				updated.Annotations = map[string]string{
+					extensionsv1beta1.AssignedSandboxNameAnnotation: "sandbox-1",
+				}
+				return p.Update(event.UpdateEvent{ObjectNew: updated, ObjectOld: claim1})
 			},
 			verify: func(t *testing.T, r *SandboxClaimReconciler) {
 				entry, ok := r.observedTimes.Load(key)
@@ -3238,6 +3242,134 @@ func TestSandboxClaimTimingPredicates(t *testing.T) {
 				t.Error("expected predicate to return true")
 			}
 			tc.verify(t, r)
+		})
+	}
+}
+
+func TestSandboxClaimUpdateAffectsReconcile(t *testing.T) {
+	now := metav1.Now()
+	base := &extensionsv1beta1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-claim",
+			Namespace:  "default",
+			UID:        "claim-uid",
+			Generation: 1,
+			Labels: map[string]string{
+				"app": "sandbox",
+			},
+			Annotations: map[string]string{
+				"example.com/original": "true",
+			},
+			Finalizers: []string{"cleanup.example.com"},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "example.com/v1",
+					Kind:       "Owner",
+					Name:       "owner",
+					UID:        "owner-uid",
+					Controller: ptr.To(true), // nolint:modernize
+				},
+			},
+		},
+		Spec: extensionsv1beta1.SandboxClaimSpec{
+			WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: "pool-a"},
+		},
+		Status: extensionsv1beta1.SandboxClaimStatus{
+			SandboxStatus: extensionsv1beta1.SandboxStatus{Name: "sandbox-a"},
+			Conditions: []metav1.Condition{
+				{
+					Type:               string(sandboxv1beta1.SandboxConditionReady),
+					Status:             metav1.ConditionFalse,
+					Reason:             "SandboxNotReady",
+					ObservedGeneration: 1,
+				},
+			},
+		},
+	}
+
+	testCases := []struct {
+		name string
+		edit func(claim *extensionsv1beta1.SandboxClaim)
+		want bool
+	}{
+		{
+			name: "status condition only ignored",
+			edit: func(claim *extensionsv1beta1.SandboxClaim) {
+				claim.Status.Conditions[0].Status = metav1.ConditionTrue
+				claim.Status.Conditions[0].Reason = "DependenciesReady"
+			},
+			want: false,
+		},
+		{
+			name: "status sandbox name only ignored",
+			edit: func(claim *extensionsv1beta1.SandboxClaim) {
+				claim.Status.SandboxStatus.Name = "sandbox-b"
+			},
+			want: false,
+		},
+		{
+			name: "assigned sandbox annotation enqueues",
+			edit: func(claim *extensionsv1beta1.SandboxClaim) {
+				claim.Annotations[extensionsv1beta1.AssignedSandboxNameAnnotation] = "sandbox-b"
+			},
+			want: true,
+		},
+		{
+			name: "spec change enqueues",
+			edit: func(claim *extensionsv1beta1.SandboxClaim) {
+				claim.Spec.WarmPoolRef.Name = "pool-b"
+			},
+			want: true,
+		},
+		{
+			name: "generation change enqueues",
+			edit: func(claim *extensionsv1beta1.SandboxClaim) {
+				claim.Generation = 2
+			},
+			want: true,
+		},
+		{
+			name: "label change enqueues",
+			edit: func(claim *extensionsv1beta1.SandboxClaim) {
+				claim.Labels["example.com/new"] = "true"
+			},
+			want: true,
+		},
+		{
+			name: "finalizer change enqueues",
+			edit: func(claim *extensionsv1beta1.SandboxClaim) {
+				claim.Finalizers = append(claim.Finalizers, "other.example.com")
+			},
+			want: true,
+		},
+		{
+			name: "owner reference change enqueues",
+			edit: func(claim *extensionsv1beta1.SandboxClaim) {
+				claim.OwnerReferences[0].UID = "new-owner-uid"
+			},
+			want: true,
+		},
+		{
+			name: "deletion timestamp change enqueues",
+			edit: func(claim *extensionsv1beta1.SandboxClaim) {
+				claim.DeletionTimestamp = &now
+			},
+			want: true,
+		},
+		{
+			name: "uid change enqueues",
+			edit: func(claim *extensionsv1beta1.SandboxClaim) {
+				claim.UID = "new-claim-uid"
+			},
+			want: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			updated := base.DeepCopy()
+			tc.edit(updated)
+			require.Equal(t, tc.want, sandboxClaimUpdateAffectsReconcile(base, updated))
 		})
 	}
 }

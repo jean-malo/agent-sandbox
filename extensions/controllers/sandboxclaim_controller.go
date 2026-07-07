@@ -1548,7 +1548,12 @@ func (r *SandboxClaimReconciler) getTimingPredicate() predicate.Funcs {
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			r.getOrRecordObservedTime(e.ObjectNew)
-			return true
+			oldClaim, oldOK := e.ObjectOld.(*extensionsv1beta1.SandboxClaim)
+			newClaim, newOK := e.ObjectNew.(*extensionsv1beta1.SandboxClaim)
+			if !oldOK || !newOK {
+				return true
+			}
+			return sandboxClaimUpdateAffectsReconcile(oldClaim, newClaim)
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
 			key := types.NamespacedName{Name: e.Object.GetName(), Namespace: e.Object.GetNamespace()}
@@ -1560,6 +1565,28 @@ func (r *SandboxClaimReconciler) getTimingPredicate() predicate.Funcs {
 			return true
 		},
 	}
+}
+
+func sandboxClaimUpdateAffectsReconcile(oldClaim, newClaim *extensionsv1beta1.SandboxClaim) bool {
+	if oldClaim.UID != newClaim.UID {
+		return true
+	}
+	if oldClaim.DeletionTimestamp.IsZero() != newClaim.DeletionTimestamp.IsZero() {
+		return true
+	}
+	if oldClaim.Generation != newClaim.Generation {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(oldClaim.Spec, newClaim.Spec) {
+		return true
+	}
+	if !maps.Equal(oldClaim.Labels, newClaim.Labels) || !maps.Equal(oldClaim.Annotations, newClaim.Annotations) {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(oldClaim.Finalizers, newClaim.Finalizers) {
+		return true
+	}
+	return !equality.Semantic.DeepEqual(oldClaim.OwnerReferences, newClaim.OwnerReferences)
 }
 
 // mapWarmPoolToClaims maps a SandboxWarmPool to a list of SandboxClaims that reference it.
