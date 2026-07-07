@@ -98,6 +98,21 @@ func TestSandboxClaimCreationRecording(t *testing.T) {
 	}
 }
 
+func TestReconcileStepDurationRecording(t *testing.T) {
+	ReconcileStepDuration.Reset()
+
+	RecordReconcileStepDuration(
+		time.Now().Add(-100*time.Millisecond),
+		"sandboxclaim",
+		"get_or_create_sandbox",
+		ReconcileStepOutcomeSuccess,
+	)
+
+	if testutil.CollectAndCount(ReconcileStepDuration) != 1 {
+		t.Errorf("Expected 1 observation")
+	}
+}
+
 func TestBuildInfo(t *testing.T) {
 	expected := strings.TrimSpace(`
 		# HELP agent_sandbox_build_info Agent sandbox controller build metadata exposed as labels with a constant value of 1.

@@ -59,6 +59,10 @@ var (
 	errStaleObservation     = errors.New("stale cached observation")
 )
 
+func recordSandboxStep(startTime time.Time, step string, err error) {
+	asmetrics.RecordReconcileStepDuration(startTime, "sandbox", step, asmetrics.ReconcileStepOutcome(err))
+}
+
 // isStaleSandboxWrite reports Sandbox writes that should not trigger an immediate
 // controller-runtime error retry. NotFound means the Sandbox is gone; Conflict means
 // another write won the resourceVersion race and will enqueue a fresh reconcile.
@@ -203,13 +207,16 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		sandbox.Annotations[asmetrics.TraceContextAnnotation] = tc
 
+		stepStart := time.Now()
 		if err := r.Patch(ctx, sandbox, patch); err != nil {
+			recordSandboxStep(stepStart, "patch_trace_context", err)
 			if isStaleSandboxWrite(err) {
 				logger.V(1).Info("Skipping stale sandbox trace context patch", "Sandbox.Namespace", sandbox.Namespace, "Sandbox.Name", sandbox.Name, "error", err.Error())
 				return ctrl.Result{}, nil
 			}
 			return ctrl.Result{}, err
 		}
+		recordSandboxStep(stepStart, "patch_trace_context", nil)
 	}
 
 	oldStatus := sandbox.Status.DeepCopy()
@@ -221,20 +228,27 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if expired {
 		if !sandboxMarkedExpired(sandbox) {
 			setSandboxExpiredCondition(sandbox)
+			stepStart := time.Now()
 			if statusUpdateErr := r.updateStatus(ctx, oldStatus, sandbox); statusUpdateErr != nil {
+				recordSandboxStep(stepStart, "update_status", statusUpdateErr)
 				if errors.Is(statusUpdateErr, errStaleSandboxMutation) {
 					logger.V(1).Info("Skipping stale sandbox expired status result", "Sandbox.Namespace", sandbox.Namespace, "Sandbox.Name", sandbox.Name, "error", statusUpdateErr.Error())
 					return ctrl.Result{}, nil
 				}
 				return ctrl.Result{}, statusUpdateErr
 			}
+			recordSandboxStep(stepStart, "update_status", nil)
 			return ctrl.Result{RequeueAfter: immediateRequeueDelay}, nil
 		}
 
 		logger.Info("Sandbox has expired, deleting child resources and checking shutdown policy")
+		stepStart := time.Now()
 		sandboxDeleted, err = r.handleSandboxExpiry(ctx, sandbox)
+		recordSandboxStep(stepStart, "handle_expiry", err)
 	} else {
+		stepStart := time.Now()
 		err = r.reconcileChildResources(ctx, sandbox)
+		recordSandboxStep(stepStart, "reconcile_child_resources", err)
 		if errors.Is(err, errStaleSandboxMutation) || errors.Is(err, errStaleObservation) {
 			logger.V(1).Info("Skipping stale sandbox reconcile result", "Sandbox.Namespace", sandbox.Namespace, "Sandbox.Name", sandbox.Name, "error", err.Error())
 			return result, nil
@@ -249,12 +263,16 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	if !sandboxDeleted {
 		// Update status
+		stepStart := time.Now()
 		if statusUpdateErr := r.updateStatus(ctx, oldStatus, sandbox); statusUpdateErr != nil {
+			recordSandboxStep(stepStart, "update_status", statusUpdateErr)
 			if errors.Is(statusUpdateErr, errStaleSandboxMutation) {
 				logger.V(1).Info("Skipping stale sandbox status result", "Sandbox.Namespace", sandbox.Namespace, "Sandbox.Name", sandbox.Name, "error", statusUpdateErr.Error())
 			} else {
 				err = errors.Join(err, statusUpdateErr)
 			}
+		} else {
+			recordSandboxStep(stepStart, "update_status", nil)
 		}
 	}
 	// return errors seen
@@ -268,14 +286,18 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	var allErrors error
 
 	// Reconcile PVCs from volumeClaimTemplates
+	stepStart := time.Now()
 	err := r.reconcilePVCs(ctx, sandbox, nameHash)
+	recordSandboxStep(stepStart, "reconcile_pvcs", err)
 	if errors.Is(err, errStaleSandboxMutation) {
 		return err
 	}
 	allErrors = errors.Join(allErrors, err)
 
 	// Reconcile Pod
+	stepStart = time.Now()
 	pod, err := r.reconcilePod(ctx, sandbox, nameHash)
+	recordSandboxStep(stepStart, "reconcile_pod", err)
 	if errors.Is(err, errStaleSandboxMutation) || errors.Is(err, errStaleObservation) {
 		return err
 	}
@@ -294,7 +316,9 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	}
 
 	// Reconcile Service
+	stepStart = time.Now()
 	svc, err := r.reconcileService(ctx, sandbox, nameHash)
+	recordSandboxStep(stepStart, "reconcile_service", err)
 	if errors.Is(err, errStaleSandboxMutation) {
 		return err
 	}

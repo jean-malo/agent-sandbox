@@ -47,6 +47,7 @@ import (
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	sandboxcontrollers "sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
+	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 )
 
 const (
@@ -57,6 +58,10 @@ const (
 	warmPoolSteadyRequeue           = 30 * time.Second
 	warmPoolEvictionAnnotation      = "cluster-autoscaler.kubernetes.io/safe-to-evict"
 )
+
+func recordSandboxWarmPoolStep(startTime time.Time, step string, err error) {
+	asmetrics.RecordReconcileStepDuration(startTime, "sandboxwarmpool", step, asmetrics.ReconcileStepOutcome(err))
+}
 
 // SandboxWarmPoolReconciler reconciles a SandboxWarmPool object.
 type SandboxWarmPoolReconciler struct {
@@ -97,16 +102,21 @@ func (r *SandboxWarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	oldStatus := warmPool.Status.DeepCopy()
 
 	// Reconcile the pool (create or delete Sandboxes as needed)
+	stepStart := time.Now()
 	result, err := r.reconcilePool(ctx, warmPool)
+	recordSandboxWarmPoolStep(stepStart, "reconcile_pool", err)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// Update status if it has changed
+	stepStart = time.Now()
 	if err := r.updateStatus(ctx, oldStatus, warmPool); err != nil {
+		recordSandboxWarmPoolStep(stepStart, "update_status", err)
 		logger.Error(err, "Failed to update SandboxWarmPool status")
 		return ctrl.Result{}, err
 	}
+	recordSandboxWarmPoolStep(stepStart, "update_status", nil)
 
 	return result, nil
 }
@@ -125,19 +135,26 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 		warmPoolSandboxLabel: poolNameHash,
 	})
 
+	stepStart := time.Now()
 	if err := r.List(ctx, sandboxList, &client.ListOptions{
 		LabelSelector: labelSelector,
 		Namespace:     warmPool.Namespace,
 	}); err != nil {
+		recordSandboxWarmPoolStep(stepStart, "list_pool_sandboxes", err)
 		logger.Error(err, "Failed to list sandboxes")
 		return result, err
 	}
+	recordSandboxWarmPoolStep(stepStart, "list_pool_sandboxes", nil)
 
 	// Fetch template and compute hash once to avoid repeated expensive operations
+	stepStart = time.Now()
 	template, currentPodTemplateHash, tmplErr := r.fetchTemplateAndHash(ctx, warmPool)
+	recordSandboxWarmPoolStep(stepStart, "fetch_template_and_hash", tmplErr)
 
 	// Delete stale pods, filter pods by ownership and adopt orphans
+	stepStart = time.Now()
 	activeSandboxes, allErrors := r.filterActiveSandboxes(ctx, warmPool, sandboxList.Items, template, currentPodTemplateHash, tmplErr)
+	recordSandboxWarmPoolStep(stepStart, "filter_active_sandboxes", allErrors)
 
 	const warmPoolReadinessGracePeriod = 5 * time.Minute
 
@@ -211,9 +228,11 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 				allErrors = errors.Join(allErrors, err)
 			} else {
 				// Parallel sandbox creation with adaptive slow-start batching (starts with 1 and doubles on success)
+				stepStart = time.Now()
 				_, createErr := slowStartBatch(ctx, int(sandboxesToCreate), 1, func(_ int) error {
 					return r.createPoolSandbox(ctx, warmPool, sandboxCR)
 				})
+				recordSandboxWarmPoolStep(stepStart, "create_pool_sandboxes", createErr)
 				if createErr != nil {
 					logger.Error(createErr, "Failed to create pool sandboxes")
 					allErrors = errors.Join(allErrors, createErr)
@@ -244,9 +263,11 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 
 		toDeleteCount := min(sandboxesToDelete, int32(len(activeSandboxes)))
 		// Parallel sandbox deletion with adaptive slow-start batching (starts with 1 and doubles on success)
+		stepStart = time.Now()
 		_, deleteErr := slowStartBatch(ctx, int(toDeleteCount), 1, func(idx int) error {
 			return r.deletePoolSandbox(ctx, &activeSandboxes[idx])
 		})
+		recordSandboxWarmPoolStep(stepStart, "delete_pool_sandboxes", deleteErr)
 		if deleteErr != nil {
 			logger.Error(deleteErr, "Failed to delete pool sandboxes")
 			allErrors = errors.Join(allErrors, deleteErr)

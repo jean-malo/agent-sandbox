@@ -28,6 +28,12 @@ const (
 	LaunchTypeCold    = "cold"    // Pod not from a SandboxWarmPool
 	LaunchTypeUnknown = "unknown" // Used when Sandbox is nil during failure
 
+	ReconcileStepOutcomeSuccess  = "success"
+	ReconcileStepOutcomeError    = "error"
+	ReconcileStepOutcomeEmpty    = "empty"
+	ReconcileStepOutcomeConflict = "conflict"
+	ReconcileStepOutcomeNotFound = "not_found"
+
 	// ObservabilityAnnotation is the annotation key for the time the controller first observed the claim.
 	ObservabilityAnnotation = "agents.x-k8s.io/controller-first-observed-at"
 
@@ -94,6 +100,20 @@ var (
 		[]string{"namespace", "sandbox_template", "launch_type", "warmpool_name", "pod_condition"},
 	)
 
+	// ReconcileStepDuration measures low-cardinality controller sub-step latency.
+	// Labels:
+	// - controller: "sandbox", "sandboxclaim", "sandboxwarmpool".
+	// - step: static sub-step name inside that controller.
+	// - outcome: "success", "error", or a small controller-specified terminal outcome.
+	ReconcileStepDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "agent_sandbox_reconcile_step_duration_seconds",
+			Help:    "Latency of named agent-sandbox controller reconcile sub-steps in seconds.",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120},
+		},
+		[]string{"controller", "step", "outcome"},
+	)
+
 	// AgentSandboxesDesc describes the agent_sandboxes metric point-in-time counts.
 	// Labels:
 	// - namespace: the namespace of the sandbox
@@ -135,6 +155,7 @@ func init() {
 	metrics.Registry.MustRegister(ClaimControllerStartupLatency)
 	metrics.Registry.MustRegister(SandboxCreationLatency)
 	metrics.Registry.MustRegister(SandboxClaimCreationTotal)
+	metrics.Registry.MustRegister(ReconcileStepDuration)
 	metrics.Registry.MustRegister(BuildInfo)
 }
 
@@ -158,4 +179,18 @@ func RecordSandboxCreationLatency(duration time.Duration, namespace, launchType,
 // RecordSandboxClaimCreation increments the total count of created sandbox claims.
 func RecordSandboxClaimCreation(namespace, templateName, launchType, warmPoolName, podCondition string) {
 	SandboxClaimCreationTotal.WithLabelValues(namespace, templateName, launchType, warmPoolName, podCondition).Inc()
+}
+
+// RecordReconcileStepDuration records a controller reconcile sub-step duration.
+func RecordReconcileStepDuration(startTime time.Time, controller, step, outcome string) {
+	duration := time.Since(startTime).Seconds()
+	ReconcileStepDuration.WithLabelValues(controller, step, outcome).Observe(duration)
+}
+
+// ReconcileStepOutcome returns the default success/error label for an error.
+func ReconcileStepOutcome(err error) string {
+	if err != nil {
+		return ReconcileStepOutcomeError
+	}
+	return ReconcileStepOutcomeSuccess
 }
