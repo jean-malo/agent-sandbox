@@ -1960,16 +1960,15 @@ func TestSandboxClaimSandboxAdoption(t *testing.T) {
 			expectNewSandboxCreated: false,
 		},
 		{
-			name: "adopts first available non-ready sandbox from queue",
+			name: "creates new sandbox when queue only has non-ready sandboxes",
 			existingObjects: []client.Object{
 				template,
 				claim,
 				createWarmPoolSandbox("not-ready-1", metav1.Time{Time: metav1.Now().Add(-2 * time.Hour)}, false),
 				createWarmPoolSandbox("not-ready-2", metav1.Time{Time: metav1.Now().Add(-1 * time.Hour)}, false),
 			},
-			expectSandboxAdoption:   true,
-			expectedAdoptedSandbox:  "not-ready-1",
-			expectNewSandboxCreated: false,
+			expectSandboxAdoption:   false,
+			expectNewSandboxCreated: true,
 		},
 		{
 			name: "corrects stale pod-name annotation when adopting sandbox",
@@ -2334,6 +2333,100 @@ func TestSandboxEventHandler_Delete_RemovesGhostPods(t *testing.T) {
 	if ok {
 		t.Errorf("Expected the deleted sandbox to be removed from the queue")
 	}
+}
+
+func TestSandboxEventHandler_Update_QueuesOnlyReadySandboxes(t *testing.T) {
+	const warmPoolName = "test-warmpool"
+
+	newSandbox := func(ready bool) *sandboxv1beta1.Sandbox {
+		conditionStatus := metav1.ConditionFalse
+		if ready {
+			conditionStatus = metav1.ConditionTrue
+		}
+		return &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pool-sb",
+				Namespace: "default",
+				Labels: map[string]string{
+					warmPoolSandboxLabel:   sandboxcontrollers.NameHash(warmPoolName),
+					sandboxTemplateRefHash: sandboxcontrollers.NameHash("template"),
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: extensionsv1beta1.GroupVersion.String(),
+						Kind:       "SandboxWarmPool",
+						Name:       warmPoolName,
+						Controller: ptr.To(true), // nolint:modernize
+					},
+				},
+			},
+			Status: sandboxv1beta1.SandboxStatus{
+				NodeName: "node-1",
+				Conditions: []metav1.Condition{
+					{
+						Type:   string(sandboxv1beta1.SandboxConditionReady),
+						Status: conditionStatus,
+						Reason: "DependenciesReady",
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("scheduled but unready sandbox is not queued", func(t *testing.T) {
+		q := queue.NewSimpleSandboxQueue()
+		handler := &sandboxEventHandler{sandboxQueue: q}
+		handler.Update(
+			context.Background(),
+			event.UpdateEvent{
+				ObjectOld: &sandboxv1beta1.Sandbox{},
+				ObjectNew: newSandbox(false),
+			},
+			nil,
+		)
+
+		_, ok := q.Get(warmPoolName)
+		require.False(t, ok)
+	})
+
+	t.Run("ready transition queues sandbox", func(t *testing.T) {
+		q := queue.NewSimpleSandboxQueue()
+		handler := &sandboxEventHandler{sandboxQueue: q}
+		handler.Update(
+			context.Background(),
+			event.UpdateEvent{
+				ObjectOld: newSandbox(false),
+				ObjectNew: newSandbox(true),
+			},
+			nil,
+		)
+
+		key, ok := q.Get(warmPoolName)
+		require.True(t, ok)
+		require.Equal(t, "pool-sb", key.Name)
+	})
+
+	t.Run("losing readiness removes sandbox", func(t *testing.T) {
+		q := queue.NewSimpleSandboxQueue()
+		handler := &sandboxEventHandler{sandboxQueue: q}
+		q.Add(warmPoolName, queue.SandboxKey{
+			Namespace: "default",
+			Name:      "pool-sb",
+			NodeName:  "node-1",
+		})
+
+		handler.Update(
+			context.Background(),
+			event.UpdateEvent{
+				ObjectOld: newSandbox(true),
+				ObjectNew: newSandbox(false),
+			},
+			nil,
+		)
+
+		_, ok := q.Get(warmPoolName)
+		require.False(t, ok)
+	})
 }
 
 func TestWarmPoolEventHandler_Delete_RemovesEntireQueue(t *testing.T) {
@@ -4193,7 +4286,15 @@ func TestSandboxClaimAdoptionStrategy(t *testing.T) {
 				createWarmPoolSandboxWithNode("sb-young-ready", metav1.Now(), true, "node-1"),
 			},
 			expectedAdoptedSandbox: "sb-young-ready",
-			expectedRemainingKeys:  []string{"sb-old-unready"},
+			expectedRemainingKeys:  []string{},
+		},
+		{
+			name: "falls back to cold sandbox when queue only has unready sandboxes",
+			existingSandboxes: []*sandboxv1beta1.Sandbox{
+				createWarmPoolSandboxWithNode("sb-old-unready", metav1.Time{Time: metav1.Now().Add(-2 * time.Hour)}, false, "node-3"),
+			},
+			expectedAdoptedSandbox: "test-claim",
+			expectedRemainingKeys:  []string{},
 		},
 		{
 			name: "uses FIFO order even when warm pool node distribution differs",
@@ -4271,7 +4372,7 @@ func TestSandboxClaimAdoptionStrategy(t *testing.T) {
 			require.Equal(t, claim.UID, controllerRef.UID)
 
 			// Verify that the expected remaining sandbox keys are still queued properly (regression test)
-			var actualRemaining []string
+			actualRemaining := []string{}
 			for {
 				key, ok := warmSandboxQueue.Get("test-pool")
 				if !ok {

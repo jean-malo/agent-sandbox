@@ -617,29 +617,17 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 	logger := log.FromContext(ctx)
 
 	var skipped []queue.SandboxKey
-	var fallbackSandbox *v1beta1.Sandbox
-	var fallbackKey queue.SandboxKey
-	var adoptingFallback bool
 
 	// Instantly returns unused keys the moment we find a valid/ready candidate!
 	defer func() {
 		for _, key := range skipped {
 			r.WarmSandboxQueue.Add(claim.Spec.WarmPoolRef.Name, key)
 		}
-		// If we parked a fallback sandbox but never ended up adopting it (due to error or adopting a ready one), requeue it.
-		if fallbackSandbox != nil && !adoptingFallback {
-			r.WarmSandboxQueue.Add(claim.Spec.WarmPoolRef.Name, fallbackKey)
-		}
 	}()
 
 	for {
 		adoptedKey, ok := r.WarmSandboxQueue.Get(claim.Spec.WarmPoolRef.Name)
 		if !ok {
-			// No more candidates in our namespace. If we found an unready fallback sandbox, return it.
-			if fallbackSandbox != nil {
-				adoptingFallback = true
-				return fallbackSandbox, fallbackKey, nil
-			}
 			return nil, queue.SandboxKey{}, nil
 		}
 
@@ -673,14 +661,9 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 		}
 
 		// Sandbox is valid but NOT Ready.
-		// Keep the first unready sandbox we found as fallback.
-		if fallbackSandbox == nil {
-			fallbackSandbox = adopted
-			fallbackKey = adoptedKey
-		} else {
-			// Push subsequent unready sandboxes to skipped so they go back to the queue
-			skipped = append(skipped, adoptedKey)
-		}
+		// Drop it from the ready-candidate queue. A future Ready transition will
+		// enqueue it again.
+		logger.V(1).Info("sandbox candidate is not ready; skipping warm pool adoption", "sandbox", adopted.Name, "warmPool", claim.Spec.WarmPoolRef.Name)
 	}
 }
 
@@ -815,6 +798,9 @@ func (r *SandboxClaimReconciler) rebuildWarmSandboxQueueOnce(ctx context.Context
 	for i := range sandboxList.Items {
 		sandbox := &sandboxList.Items[i]
 		if err := verifySandboxCandidate(sandbox, claim); err != nil {
+			continue
+		}
+		if !isSandboxReady(sandbox) {
 			continue
 		}
 		r.WarmSandboxQueue.Add(poolName, queue.SandboxKey{
@@ -1733,8 +1719,18 @@ func (h *sandboxEventHandler) Update(ctx context.Context, e event.UpdateEvent, _
 
 	poolChanged := oldWarmPoolName != newWarmPoolName
 	nodeScheduled := oldSandbox.Status.NodeName != newSandbox.Status.NodeName
+	oldReady := oldAdoptable && isSandboxReady(oldSandbox)
+	newReady := newAdoptable && isSandboxReady(newSandbox)
 
-	if (!oldAdoptable && newAdoptable) || (newAdoptable && poolChanged) || (newAdoptable && nodeScheduled) {
+	if oldWarmPoolName != "" && (poolChanged || (oldReady && !newReady) || (oldAdoptable && !newAdoptable)) {
+		h.sandboxQueue.RemoveItem(oldWarmPoolName, queue.SandboxKey{
+			Namespace: oldSandbox.Namespace,
+			Name:      oldSandbox.Name,
+			NodeName:  oldSandbox.Status.NodeName,
+		})
+	}
+
+	if newReady && (!oldReady || poolChanged || nodeScheduled) {
 		// Add/update sandbox in the queue
 		key := queue.SandboxKey{
 			Namespace: newSandbox.Namespace,
