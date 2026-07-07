@@ -35,6 +35,7 @@ import (
 	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 )
 
 // Create a test scheme with extensions types registered.
@@ -56,9 +57,44 @@ func TestReserveCreateBatchCooldown(t *testing.T) {
 	}
 	now := time.Now()
 
-	require.True(t, reconciler.reserveCreateBatch(warmPool, now))
-	require.False(t, reconciler.reserveCreateBatch(warmPool, now.Add(time.Second)))
-	require.True(t, reconciler.reserveCreateBatch(warmPool, now.Add(warmPoolCreateCooldown)))
+	require.True(t, reconciler.reserveCreateBatch(warmPool, "hash-a", now))
+	require.False(t, reconciler.reserveCreateBatch(warmPool, "hash-a", now.Add(time.Second)))
+	require.True(t, reconciler.reserveCreateBatch(warmPool, "hash-b", now.Add(time.Second)))
+	require.True(t, reconciler.reserveCreateBatch(warmPool, "hash-a", now.Add(warmPoolCreateCooldown)))
+}
+
+func TestWarmPoolPrimaryPredicateIgnoresStatusOnlyUpdates(t *testing.T) {
+	pred := warmPoolPrimaryPredicate()
+	oldWarmPool := &extensionsv1beta1.SandboxWarmPool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "test-pool",
+			Namespace:       "default",
+			Generation:      1,
+			ResourceVersion: "1",
+		},
+		Spec: extensionsv1beta1.SandboxWarmPoolSpec{Replicas: 3},
+		Status: extensionsv1beta1.SandboxWarmPoolStatus{
+			Replicas:      3,
+			ReadyReplicas: 2,
+		},
+	}
+
+	statusUpdate := oldWarmPool.DeepCopy()
+	statusUpdate.ResourceVersion = "2"
+	statusUpdate.Status.ReadyReplicas = 3
+	require.False(t, pred.Update(event.UpdateEvent{
+		ObjectOld: oldWarmPool,
+		ObjectNew: statusUpdate,
+	}))
+
+	specUpdate := oldWarmPool.DeepCopy()
+	specUpdate.ResourceVersion = "3"
+	specUpdate.Generation = 2
+	specUpdate.Spec.Replicas = 4
+	require.True(t, pred.Update(event.UpdateEvent{
+		ObjectOld: oldWarmPool,
+		ObjectNew: specUpdate,
+	}))
 }
 
 func createPoolSandbox(poolName, namespace, poolNameHash string, template *extensionsv1beta1.SandboxTemplate, suffix string) *sandboxv1beta1.Sandbox {

@@ -54,7 +54,6 @@ const (
 	warmPoolSandboxLabel            = sandboxv1beta1.SandboxWarmPoolLabel
 	sandboxCreateDeleteMaxBatchSize = 300
 	warmPoolCreateCooldown          = 5 * time.Second
-	warmPoolCreateCooldownMinBatch  = 50
 	warmPoolEvictionAnnotation      = "cluster-autoscaler.kubernetes.io/safe-to-evict"
 )
 
@@ -187,7 +186,8 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 	// Create new sandboxes if we need more
 	if currentReplicas < desiredReplicas && tmplErr == nil {
 		sandboxesToCreate := min(desiredReplicas-currentReplicas, maxBatchSize)
-		if sandboxesToCreate >= warmPoolCreateCooldownMinBatch && !r.reserveCreateBatch(warmPool, now) {
+		templateVersion := SandboxTemplateRefHash(warmPool.Spec.TemplateRef.Name) + "/" + currentPodTemplateHash
+		if !r.reserveCreateBatch(warmPool, templateVersion, now) {
 			logger.Info(
 				"Skipping pool sandbox creation while previous batch settles",
 				"count", sandboxesToCreate,
@@ -250,11 +250,11 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 	return allErrors
 }
 
-func (r *SandboxWarmPoolReconciler) reserveCreateBatch(warmPool *extensionsv1beta1.SandboxWarmPool, now time.Time) bool {
+func (r *SandboxWarmPoolReconciler) reserveCreateBatch(warmPool *extensionsv1beta1.SandboxWarmPool, templateVersion string, now time.Time) bool {
 	key := types.NamespacedName{
 		Namespace: warmPool.Namespace,
 		Name:      warmPool.Name,
-	}.String()
+	}.String() + "/" + templateVersion
 	if rawLastCreated, ok := r.recentPoolCreates.Load(key); ok {
 		lastCreated := rawLastCreated.(time.Time)
 		if now.Sub(lastCreated) < warmPoolCreateCooldown {
@@ -593,6 +593,10 @@ func (r *SandboxWarmPoolReconciler) comparePodSpecs(template *extensionsv1beta1.
 	return equality.Semantic.DeepEqual(expectedSpec, actualSandboxSpec)
 }
 
+func warmPoolPrimaryPredicate() predicate.Predicate {
+	return predicate.GenerationChangedPredicate{}
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *SandboxWarmPoolReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWorkers int) error {
 	if r.MaxBatchSize <= 0 {
@@ -609,7 +613,7 @@ func (r *SandboxWarmPoolReconciler) SetupWithManager(mgr ctrl.Manager, concurren
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&extensionsv1beta1.SandboxWarmPool{}).
+		For(&extensionsv1beta1.SandboxWarmPool{}, builder.WithPredicates(warmPoolPrimaryPredicate())).
 		Owns(
 			&sandboxv1beta1.Sandbox{},
 			builder.WithPredicates(predicate.Funcs{
